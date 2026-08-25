@@ -1,0 +1,26 @@
+{
+  "name": "dsh-clear-tool-results",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness host plugin: per-turn tool-result clearing with a /clear-tool-results on|off|status command.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "tool-result",
+    "compaction",
+    "context"
+  ],
+  "license": "MIT"
+}
