@@ -88,9 +88,11 @@ function clearTurnToolResults(session, endedTurn) {
 
   // Map tool-call ids to their tool names: a tool/result's data carries only
   // `message.source.callId`, the tool name lives on the matching tool/call.
+  // tool/call is NOT a surface event (the model-visible surface holds only
+  // user/message, assistant/message, and tool/result), so it must be looked up
+  // in the full append-only event log, never in `session.surface.nodes`.
   const toolNameByCall = new Map()
-  for (const seq of nodes) {
-    const original = session.events[seq]
+  for (const original of session.events) {
     if (!original || original.type !== TOOL_CALL) continue
     if (typeof original.data?.callId !== 'string') continue
     if (typeof original.data.name !== 'string') continue
