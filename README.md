@@ -1,6 +1,6 @@
 # dsh-clear-tool-results
 
-DeepSeek Harness（DSH）host 平面插件：**每个 turn 结束时，把上一轮产生的 `tool/result` 从模型上下文中清除**，并提供聊天命令开关：
+A DeepSeek Harness (DSH) **host-plane** plugin: at the end of each turn it keeps only the **last `tool/result` per tool** from the just-finished turn and clears every `tool/result` from **older turns** out of the model's context. It provides a chat command to toggle the behavior:
 
 ```
 /clear-tool-results on|off|status
@@ -10,62 +10,71 @@ GitHub: <https://github.com/stultuss/dsh-clear-tool-results>
 
 npm: <https://www.npmjs.com/package/dsh-clear-tool-results>
 
-## 为什么需要它
+## Why
 
-DSH 的会话日志是 append-only 的，模型可见历史由 `session.surface` 派生。大型工具输出会一直留在后续轮次的请求里，白白占用上下文。
+DSH session logs are append-only; the model-visible history is derived from `session.surface`. Large tool outputs stay in every subsequent turn's request, wasting context window.
 
-本插件在每个 `turn/end` 后，把刚结束那一轮的 `tool/result` 节点替换成：
+This plugin runs after each `turn/end`:
+
+1. Within the turn that just ended, only the last complete result of each tool name is kept; the other results are replaced with:
 
 ```text
-[上一轮工具结果已清除]
+[middle tool results cleared]
 ```
 
-原始工具结果仍保留在会话日志中（持久化、回放、聊天 transcript 不受影响），只是不再发给模型。
+2. All results from older turns (including the kept result from the previous turn) are replaced with:
+
+```text
+[previous-turn tool results cleared]
+```
+
+The original tool results remain in the session log (persistence, replay, and the chat transcript are unaffected) — they are simply no longer sent to the model.
 
 <img width="1124" height="563" alt="image" src="https://github.com/user-attachments/assets/d0b6fc5b-dacc-47e0-a240-ce86d41d541f" />
 <img width="1136" height="559" alt="image" src="https://github.com/user-attachments/assets/44b9ff52-e1c3-4298-80ea-24894d686e88" />
 
+## Features
 
-## 特性
+- Host-plane plugin: applies to **all sessions / all agent presets**;
+- Chat command toggle — enable/disable without editing files;
+- State persisted in `$DSH_HOME/clear-tool-results.json` (enabled by default);
+- Each turn is grouped by tool name (resolved via the `tool/call` events' `callId` ↔ `name` mapping), keeping only the last complete result per tool; the middle results are replaced with a placeholder too;
+- Tool results kept from the previous turn and earlier are cleared at the end of the current turn;
+- Only Node built-in modules are used — no third-party runtime dependencies;
+- Plays well with DSH's built-in compaction (`/compact`, `dsh-compaction-basic`, `dsh-compaction-tool-result-pruner`).
 
-- host 平面插件：对**所有会话 / 所有 agent preset** 生效；
-- 聊天命令开关，无需改文件即可启用/禁用；
-- 开关状态持久化在 `$DSH_HOME/clear-tool-results.json`（默认开启）；
-- 只依赖 Node 内置模块，无第三方运行时依赖；
-- 与 DSH 内置 compaction（`/compact`、`dsh-compaction-basic`、`dsh-compaction-tool-result-pruner`）互不冲突。
+## Install
 
-## 安装
+### 1. Install the npm package
 
-### 1. 安装 npm 包
-
-**从 npm 安装（推荐）：**
+**From npm (recommended):**
 
 ```sh
 dsh plugin --profile web add dsh-clear-tool-results
 ```
 
-等价于在该 profile 目录下执行：
+Equivalent to running in the profile directory:
 
 ```sh
 cd ~/.dsh/profiles/web
 pnpm add dsh-clear-tool-results
 ```
 
-**或从 GitHub 安装：**
+**Or from GitHub:**
 
 ```sh
 dsh plugin --profile web add github:stultuss/dsh-clear-tool-results
 ```
 
-**或使用本地 tarball：** 把 `dsh-clear-tool-results-0.1.0.tgz` 放到方便的位置，然后：
+**Or from a local tarball:** put `dsh-clear-tool-results-0.1.0.tgz` somewhere convenient, then:
 
 ```sh
 dsh plugin --profile web add ./dsh-clear-tool-results-0.1.0.tgz
 ```
 
-### 2. 在 profile 的 `cordis.patch.yml` 中注册
+### 2. Register it in the profile's `cordis.patch.yml`
 
-在 `~/.dsh/profiles/web/cordis.patch.yml`（或对应 profile）里加入：
+Add the following to `~/.dsh/profiles/web/cordis.patch.yml` (or your profile's):
 
 ```yaml
 - insert:
@@ -73,19 +82,19 @@ dsh plugin --profile web add ./dsh-clear-tool-results-0.1.0.tgz
       name: 'dsh-clear-tool-results'
 ```
 
-保存后 DSH 会热重载配置（无需重启服务）。如果 Web 输入框的命令菜单没更新，刷新页面即可。
+DSH hot-reloads the config after saving (no service restart needed). If the command menu in the web input box does not refresh, reload the page.
 
-## 使用
+## Usage
 
-在聊天输入框输入：
+Type in the chat input box:
 
-| 命令 | 效果 |
+| Command | Effect |
 | --- | --- |
-| `/clear-tool-results on` | 开启：每轮结束后清除上一轮工具结果 |
-| `/clear-tool-results off` | 关闭：保留上一轮工具结果 |
-| `/clear-tool-results status` | 查看当前开关状态 |
+| `/clear-tool-results on` | Enable: keep only the last result of each tool per turn, and clear tool results from older turns |
+| `/clear-tool-results off` | Disable: keep all tool results |
+| `/clear-tool-results status` | Show the current toggle state |
 
-开关状态文件：
+State file:
 
 ```json
 // $DSH_HOME/clear-tool-results.json
@@ -94,35 +103,37 @@ dsh plugin --profile web add ./dsh-clear-tool-results-0.1.0.tgz
 }
 ```
 
-文件缺失时视为开启。
+A missing file is treated as enabled.
 
-## 工作原理
+## How it works
 
-1. 插件监听 `session/event` 中的 `turn/end`；
-2. 找出刚结束那一轮里所有 append-origin 的 `tool/result` 节点；
-3. 逐个 `session.append('tool/result', ..., { surfaceOp: { op: 'replace', start, end }, sourceEventSeqs: [seq] })` 替换为占位内容；
-4. 替换仅修改 `message.content`，保留 `turn`、`step`、`callId`、错误字段与 `meta`；
-5. 原事件仍在 append-only 日志中，可回放。
+1. The plugin listens for `turn/end` in `session/event`;
+2. It collects all append-origin `tool/result` nodes of the turn that just ended;
+3. Tool names are resolved from the matching `tool/call` events (`message.source.callId` → `callId`/`name`), falling back to `toolName` / `name` / `tool` / `meta.*` fields on the result itself;
+4. Results are grouped by tool name; within each group only the last node in surface order is kept, and the rest are replaced with `[middle tool results cleared]`;
+5. All append-origin `tool/result` nodes from older turns are replaced with `[previous-turn tool results cleared]`;
+6. Replacement is done via `session.append('tool/result', ..., { surfaceOp: { op: 'replace', start, end }, sourceEventSeqs: [seq] })`, which modifies only `message.content` (keeping the `tool-result` wrapper shape, as DSH surface rules require) and preserves `turn`, `step`, `callId`, error fields, and `meta`;
+7. The original events remain in the append-only log and can be replayed.
 
-## 验证
+## Verify
 
-- 新建会话；
-- 第一轮：`请务必调用 bash 执行：echo secret-12345，然后只回复"完成"`；
-- 第二轮：`刚才那条 secret 是什么？`
+- Create a new session;
+- Turn 1: `Please call bash to run: echo secret-12345, then reply only "done"`;
+- Turn 2: `What was that secret earlier?`
 
-若开启清理，模型看不到 `secret-12345`，只会看到 `[上一轮工具结果已清除]`。
+With clearing enabled, the model cannot see `secret-12345` — it only sees `[previous-turn tool results cleared]`.
 
-## 卸载
+## Uninstall
 
-1. 从 `cordis.patch.yml` 删除注册行；
-2. 移除依赖：
+1. Remove the registration line from `cordis.patch.yml`;
+2. Remove the dependency:
 
 ```sh
 dsh plugin --profile web remove dsh-clear-tool-results
 ```
 
-3. （可选）删除 `$DSH_HOME/clear-tool-results.json`。
+3. (Optional) Delete `$DSH_HOME/clear-tool-results.json`.
 
-## 许可证
+## License
 
 MIT
