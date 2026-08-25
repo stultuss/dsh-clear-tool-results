@@ -1,6 +1,6 @@
 {
   "name": "dsh-clear-tool-results",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": "stultuss",
   "description": "DeepSeek Harness host plugin: per-turn tool-result clearing with a /clear-tool-results on|off|status command.",
   "homepage": "https://github.com/stultuss/dsh-clear-tool-results#readme",
@@ -13,7 +13,8 @@
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./cordis.path.yml": "./cordis.path.yml"
   },
   "dsh": {
     "bundle": {
