@@ -6,10 +6,6 @@ DeepSeek Harness（DSH）host 平面插件：**每个 turn 结束时，把上一
 /clear-tool-results on|off|status
 ```
 
-<img width="1124" height="563" alt="image" src="https://github.com/user-attachments/assets/d0b6fc5b-dacc-47e0-a240-ce86d41d541f" />
-<img width="1136" height="559" alt="image" src="https://github.com/user-attachments/assets/44b9ff52-e1c3-4298-80ea-24894d686e88" />
-
-
 ## 为什么需要它
 
 DSH 的会话日志是 append-only 的，模型可见历史由 `session.surface` 派生。大型工具输出会一直留在后续轮次的请求里，白白占用上下文。
@@ -21,6 +17,10 @@ DSH 的会话日志是 append-only 的，模型可见历史由 `session.surface`
 ```
 
 原始工具结果仍保留在会话日志中（持久化、回放、聊天 transcript 不受影响），只是不再发给模型。
+
+<img width="1124" height="563" alt="image" src="https://github.com/user-attachments/assets/d0b6fc5b-dacc-47e0-a240-ce86d41d541f" />
+<img width="1136" height="559" alt="image" src="https://github.com/user-attachments/assets/44b9ff52-e1c3-4298-80ea-24894d686e88" />
+
 
 ## 特性
 
