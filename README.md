@@ -5,6 +5,8 @@ DeepSeek Harness（DSH）host 平面插件：**每个 turn 结束时，把上一
 ```
 /clear-tool-results on|off|status
 ```
+<img width="758" height="360" alt="f2b7f5ca01cf773ea4b479aac475293f" src="https://github.com/user-attachments/assets/8f92a034-c429-40cd-8f2c-1468c1f959f7" />
+
 
 ## 为什么需要它
 
