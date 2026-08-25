@@ -6,6 +6,10 @@ DeepSeek Harness（DSH）host 平面插件：**每个 turn 结束时，把上一
 /clear-tool-results on|off|status
 ```
 
+GitHub: <https://github.com/stultuss/dsh-clear-tool-results>
+
+npm: <https://www.npmjs.com/package/dsh-clear-tool-results>
+
 ## 为什么需要它
 
 DSH 的会话日志是 append-only 的，模型可见历史由 `session.surface` 派生。大型工具输出会一直留在后续轮次的请求里，白白占用上下文。
@@ -34,17 +38,29 @@ DSH 的会话日志是 append-only 的，模型可见历史由 `session.surface`
 
 ### 1. 安装 npm 包
 
-把 `dsh-clear-tool-results-0.1.0.tgz` 放到方便的位置，然后在目标 profile 中安装：
+**从 npm 安装（推荐）：**
 
 ```sh
-dsh plugin --profile web add ./dsh-clear-tool-results-0.1.0.tgz
+dsh plugin --profile web add dsh-clear-tool-results
 ```
 
 等价于在该 profile 目录下执行：
 
 ```sh
 cd ~/.dsh/profiles/web
-pnpm add ./dsh-clear-tool-results-0.1.0.tgz
+pnpm add dsh-clear-tool-results
+```
+
+**或从 GitHub 安装：**
+
+```sh
+dsh plugin --profile web add github:stultuss/dsh-clear-tool-results
+```
+
+**或使用本地 tarball：** 把 `dsh-clear-tool-results-0.1.0.tgz` 放到方便的位置，然后：
+
+```sh
+dsh plugin --profile web add ./dsh-clear-tool-results-0.1.0.tgz
 ```
 
 ### 2. 在 profile 的 `cordis.patch.yml` 中注册
@@ -63,11 +79,11 @@ pnpm add ./dsh-clear-tool-results-0.1.0.tgz
 
 在聊天输入框输入：
 
-| 命令                         | 效果                               |
-| ---------------------------- | ---------------------------------- |
-| `/clear-tool-results on`     | 开启：每轮结束后清除上一轮工具结果 |
-| `/clear-tool-results off`    | 关闭：保留上一轮工具结果           |
-| `/clear-tool-results status` | 查看当前开关状态                   |
+| 命令 | 效果 |
+| --- | --- |
+| `/clear-tool-results on` | 开启：每轮结束后清除上一轮工具结果 |
+| `/clear-tool-results off` | 关闭：保留上一轮工具结果 |
+| `/clear-tool-results status` | 查看当前开关状态 |
 
 开关状态文件：
 
