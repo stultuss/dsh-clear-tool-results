@@ -3,4 +3,4 @@
 # overrides, disables, and insert lists; `!!js` expressions allowed).
 - insert:
     - id: clear-tool-results-host
-      name: ./clear-tool-results-host.mjs
+      name: dsh-clear-tool-results
