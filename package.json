@@ -1,8 +1,8 @@
 {
   "name": "dsh-clear-tool-results",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "author": "stultuss",
-  "description": "DeepSeek Harness host plugin: per-turn tool-result pruning with a /clear-tool-results on|off|status command.",
+  "description": "DeepSeek Harness host plugin: archive each round's raw tool results into the session folder, clear them from the visible conversation at the next round boundary, and let the model recall them through a read_tool_result_log tool.",
   "homepage": "https://github.com/stultuss/dsh-clear-tool-results#readme",
   "repository": {
     "type": "git",
