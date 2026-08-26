@@ -4,8 +4,8 @@ DSH 宿主插件：每轮对话结束后，把该轮的原始工具结果归档�
 
 命令：`/clear-tool-results on|off|status`
 
-GitHub: <https://github.com/stultuss/dsh-clear-tool-results>
-npm: <https://www.npmjs.com/package/dsh-clear-tool-results>
+- GitHub: <https://github.com/stultuss/dsh-clear-tool-results>
+- npm: <https://www.npmjs.com/package/dsh-clear-tool-results>
 
 ## 功能
 
