@@ -7,6 +7,9 @@ DSH 宿主插件：每轮对话结束后，把该轮的原始工具结果（tool
 - GitHub: <https://github.com/stultuss/dsh-clear-tool-results>
 - npm: <https://www.npmjs.com/package/dsh-clear-tool-results>
 
+<img width="1594" height="417" alt="image" src="https://github.com/user-attachments/assets/a1247911-e0b6-4ae1-97ba-c99a17c31da0" />
+
+
 ## 功能
 
 - **归档**：每轮结束时，从追加式会话日志（非改写后的 surface）取出该轮原始 `tool/result` 事件，写入 `~/.dsh/sessions/<workspace>/<session-id>/tool-result-logs/round-NNNN.json`（附 `index.json` 清单），原始数据完整保留（含工具名、匹配的 `tool/call` 事件）。
