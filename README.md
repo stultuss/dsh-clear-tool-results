@@ -1,3 +1,5 @@
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/stultuss/dsh-clear-tool-results)
+
 # dsh-clear-tool-results
 
 DSH 宿主插件：每轮对话结束后，把该轮的原始工具结果（tool result）归档到会话目录（tool-result-logs），并从上下文中清除，减少 Token 消耗；模型可用 read_tool_result_log 工具按轮次或时间自主读取归档数据。
