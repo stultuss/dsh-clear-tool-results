@@ -109,11 +109,18 @@ async function enableNow(ctx, session) {
   }
 }
 
+/**
+ * 兼容新旧 dsh 核心的事件数组：新核心暴露 session.log，旧核心暴露 session.events。
+ */
+function eventsOf(session) {
+  return Array.isArray(session.log) ? session.log : session.events
+}
+
 /** 当前进行中的轮次；无则返回 null。 */
 function currentOpenTurn(session) {
   let start = null
   let end = null
-  for (const event of session.events) {
+  for (const event of eventsOf(session)) {
     if (event.type === TURN_START) start = event.data?.turn ?? start
     else if (event.type === TURN_END) end = event.data?.turn ?? end
   }
@@ -127,7 +134,7 @@ function currentOpenTurn(session) {
 function clearCompletedToolResults(session, untilTurn) {
   const nodes = [...session.surface.nodes]
   for (const seq of nodes) {
-    const original = session.events[seq]
+    const original = eventsOf(session)[seq]
     if (!original || original.type !== TOOL_RESULT) continue
     if (original.surfaceOp !== 'append') continue
     const turn = original.data?.turn
@@ -161,7 +168,7 @@ async function archiveUnarchived(session, maxTurn, logsDir) {
   const index = await readIndex(logsDir)
   const archived = new Set((index?.rounds ?? []).map((round) => round.turn))
   const turns = new Set()
-  for (const event of session.events) {
+  for (const event of eventsOf(session)) {
     if (event.type !== TOOL_RESULT || event.surfaceOp !== 'append') continue
     const turn = event.data?.turn
     if (typeof turn === 'number' && turn <= maxTurn) turns.add(turn)
@@ -178,7 +185,7 @@ async function archiveTurn(session, turn, logsDir, overwrite) {
   if (!overwrite && index?.rounds.some((round) => round.turn === turn)) return
   const { nameByCallId, callByCallId } = callIndex(session)
   const entries = []
-  for (const event of session.events) {
+  for (const event of eventsOf(session)) {
     if (event.type !== TOOL_RESULT || event.surfaceOp !== 'append') continue
     if (event.data?.turn !== turn) continue
     entries.push(entryOf(event, nameByCallId, callByCallId))
@@ -230,7 +237,7 @@ function entryOf(event, nameByCallId, callByCallId) {
 function callIndex(session) {
   const nameByCallId = new Map()
   const callByCallId = new Map()
-  for (const event of session.events) {
+  for (const event of eventsOf(session)) {
     if (event.type !== TOOL_CALL) continue
     if (typeof event.data?.callId !== 'string') continue
     callByCallId.set(event.data.callId, event)

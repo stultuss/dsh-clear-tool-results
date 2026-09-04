@@ -2,6 +2,8 @@
 
 DSH 宿主插件：每轮对话结束后，把该轮的原始工具结果（tool result）归档到会话目录（tool-result-logs），并从上下文中清除，减少 Token 消耗；模型可用 read_tool_result_log 工具按轮次或时间自主读取归档数据。
 
+> **兼容性**：同一份代码同时支持新旧两代 Harness 核心——新核心 ≥ **0.1.2-rc.1**（会话事件数组为 `session.log`）以及升级前的老核心（事件数组为 `session.events`，具体版本号未记录）。插件内部通过 `eventsOf()` 自动探测，无需按环境区分。
+
 命令：`/clear-tool-results on|off|status`
 
 - GitHub: <https://github.com/stultuss/dsh-clear-tool-results>
