@@ -18,6 +18,30 @@ DSH 宿主插件：把工具结果（tool result）从对话上下文中清除�
 
 <img width="1594" height="417" alt="image" src="https://github.com/user-attachments/assets/a1247911-e0b6-4ae1-97ba-c99a17c31da0" />
 
+## 安装
+
+```sh
+dsh plugin --profile web add dsh-clear-tool-results
+```
+
+在 `~/.dsh/profiles/web/cordis.patch.yml` 注册：
+
+```yaml
+- insert:
+    - id: clear-tool-results-host
+      name: 'dsh-clear-tool-results'
+```
+
+## 使用
+
+| 命令 | 效果 |
+| --- | --- |
+| `/clear-tool-results on` | 启用普通模式：每轮归档 + 轮末清除 |
+| `/clear-tool-results overclock` | 启用激进模式：每步即时归档 + 滞后一步清除 |
+| `/clear-tool-results off` | 停用：保留工具结果，不再归档 |
+| `/clear-tool-results status` | 查看当前状态（启用与否 + 模式） |
+
+模式切换建议在轮次之间进行；轮中途切换时新规则只对之后的步骤生效，已经清除的结果保持占位符（原始数据可在日志中读取）。
 
 ## 功能
 
@@ -71,31 +95,6 @@ turn/end：归档整轮，兜底清除最后一步结果
 
 - 用户问"上一轮 bash 命令的输出是什么？"→ `read_tool_result_log({ turn: 2 })`；
 - overclock 占位符提示"第 1 轮 第 3 步"→ `read_tool_result_log({ turn: 1, step: 3 })`。
-
-## 安装
-
-```sh
-dsh plugin --profile web add dsh-clear-tool-results
-```
-
-在 `~/.dsh/profiles/web/cordis.patch.yml` 注册：
-
-```yaml
-- insert:
-    - id: clear-tool-results-host
-      name: 'dsh-clear-tool-results'
-```
-
-## 使用
-
-| 命令 | 效果 |
-| --- | --- |
-| `/clear-tool-results on` | 启用普通模式：每轮归档 + 轮末清除 |
-| `/clear-tool-results overclock` | 启用激进模式：每步即时归档 + 滞后一步清除 |
-| `/clear-tool-results off` | 停用：保留工具结果，不再归档 |
-| `/clear-tool-results status` | 查看当前状态（启用与否 + 模式） |
-
-模式切换建议在轮次之间进行；轮中途切换时新规则只对之后的步骤生效，已经清除的结果保持占位符（原始数据可在日志中读取）。
 
 ## 原理简述
 
