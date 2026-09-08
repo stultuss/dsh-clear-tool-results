@@ -49,7 +49,7 @@ agent-loop 侧带 `??` 回退，所以两个文件可以分别应用/回退，�
 
 ```bash
 npm run patch:status   # 查看状态
-npm run patch:apply    # 应用（自动备份到 patches/backups/）
+npm run patch:apply    # 应用（自动备份到 ~/.dsh/clear-tool-results-backups/）
 npm run patch:revert   # 回退
 node patches/patch-core.mjs apply --root /path/to/@deepseek-ai/dsh
 ```
@@ -59,5 +59,5 @@ node patches/patch-core.mjs apply --root /path/to/@deepseek-ai/dsh
 * 补丁写入的是磁盘上的核心文件，**必须重启 dsh GUI 进程**才会加载新代码。
 * 应用前会校验每个位点的目标文本恰好出现一次；核心版本升级导致文本变化时会拒绝应用并提示，
   不会写入半成品。
-* 原始文件备份在 `patches/backups/`（首次应用时创建），`revert` 优先从备份恢复。
+* 原始文件备份在 `~/.dsh/clear-tool-results-backups/`（首次应用时创建），`revert` 优先从备份恢复。
 * 核心包升级/重装后补丁会被覆盖，重新执行 `npm run patch:apply` 即可。

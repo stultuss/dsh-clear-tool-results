@@ -61,7 +61,7 @@ append 一个 `request/header {reason:"series"}`，Chat 界面就为每个系列
 
 ```sh
 npm run patch:status   # 状态
-npm run patch:apply    # 应用（自动备份到 patches/backups/）
+npm run patch:apply    # 应用（自动备份到 ~/.dsh/clear-tool-results-backups/）
 npm run patch:revert   # 回退
 ```
 

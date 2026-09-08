@@ -18,10 +18,10 @@
  *   所以两个文件可以独立应用/回退，任一侧未打补丁都保持原行为）。
  *
  * 用法
- *   node scripts/patch-core.mjs status            # 查看补丁状态
- *   node scripts/patch-core.mjs apply             # 应用（自动备份）
- *   node scripts/patch-core.mjs revert            # 回退
- *   node scripts/patch-core.mjs apply --root /path/to/@deepseek-ai/dsh
+ *   node patches/patch-core.mjs status            # 查看补丁状态
+ *   node patches/patch-core.mjs apply             # 应用（备份到 ~/.dsh/clear-tool-results-backups/）
+ *   node patches/patch-core.mjs revert            # 回退
+ *   node patches/patch-core.mjs apply --root /path/to/@deepseek-ai/dsh
  *   也通过 npm run patch:status / patch:apply / patch:revert 调用。
  *
  * 注意
@@ -32,12 +32,11 @@
 import { spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const REPO_ROOT = resolve(HERE, '..')
-const BACKUP_DIR = join(REPO_ROOT, 'patches', 'backups')
+const BACKUP_DIR = join(homedir(), '.dsh', 'clear-tool-results-backups')
 
 const SESSION_REL = 'node_modules/@deepseek-ai/dsh-session/lib/index.js'
 const AGENT_LOOP_REL = 'node_modules/@deepseek-ai/dsh-agent-loop/lib/index.js'
