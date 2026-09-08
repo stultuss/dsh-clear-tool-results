@@ -1,0 +1,14 @@
+{
+  "schema": "explore-summarize-fixture-v1",
+  "note": "每个文件预埋 2 个事实；value 必须与原文一字不差地出现在总结的关键事实清单中，并归属到正确文件。",
+  "facts": [
+    { "file": "README.md", "key": "APP_NAME", "value": "Meridian" },
+    { "file": "README.md", "key": "RELEASE", "value": "2026.09-rc3" },
+    { "file": "config/app.json", "key": "server.port", "value": "8321" },
+    { "file": "config/app.json", "key": "gate.flag", "value": "gamma-9" },
+    { "file": "src/lib.js", "key": "APP_ID", "value": "ALPHA-7" },
+    { "file": "src/lib.js", "key": "POOL_SIZE", "value": "24" },
+    { "file": "docs/notes.txt", "key": "RATE_LIMIT", "value": "120" },
+    { "file": "docs/notes.txt", "key": "UPSTREAM", "value": "cache.internal:8443" }
+  ]
+}

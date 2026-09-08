@@ -2,6 +2,29 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。
 
+## [0.5.0] - 2026-09-08
+
+- overclock：每轮第一条清除占位符附带“可见性规则”扩展说明（逐步可见、取回内容同样只存活一步、需要精确原文时用前再取、总结引用多步前可整轮取回一次）；其余占位符保持短文本，控制常驻上下文开销。
+- `read_tool_result_log`：成功返回内容时附带 `note` 提示字段（取回内容只存活一步请立即使用；总结前可整轮取回一次）；工具描述补充 overclock 使用提醒。
+- 依据同语料 A/B 测试（无提示基线 vs 策略提示组：步骤 14→7、取回 6→1 次、输入 token −71%、困惑片段 6→0、事实命中均 8/8）把提示固化为插件内建引导。
+
+## [0.4.0] - 2026-09-08
+
+### 新增
+
+- 新增 `overclock` 激进模式：同一轮内按核心 step 滞后一步清除工具结果——第 N 步结果仅对第 N+1 步的决策可见，第 N+1 步 `step/end` 时替换为占位符；每步结束即时归档为 `round-NNNN-step-MMM.json`，并写入 `index.json` 的 `steps` 清单。
+- `/clear-tool-results` 命令新增 `overclock` 子命令，状态升级为 `{ enabled, mode: 'round' | 'overclock' }`（旧状态文件自动按普通模式兼容）；`status` 同时显示启用状态与模式。
+- `read_tool_result_log` 新增 `step` 参数，可按 `{ turn, step }` 精确读取某步原始结果；轮次进行中只有步骤文件时按 `turn` 读取会自动合并。
+- `read_tool_result_log()` 无参轮次列表会包含"进行中但已有 step 文件"的轮次（`inProgress: true`），轮次未结束时模型也能发现可读步骤。
+- 清除占位符在具备步骤信息时注明 `turn + step`，引导模型精确取回：`[第 1 轮 第 3 步工具结果已清除归档，可用 read_tool_result_log(turn: 1, step: 3) 读取]`。
+- 归档 schema 升级到 version 2：`round-NNNN.json` 与 step 文件条目顶层新增 `turn`/`step` 字段。
+
+### 变更
+
+- `clear-tool-results` 命令用法由 `on|off|status` 扩展为 `on|off|status|overclock`。
+- 归档写入为"先清除、后异步写盘"的顺序，保证 overclock 的逐步清除不会与下一步 prompt 组装竞态。
+- overclock 依赖核心 `step/end` 事件；老核心（无步骤事件）自动退化为普通每轮行为。
+
 ## [0.3.0] - 2026-09-04
 
 ### 新增

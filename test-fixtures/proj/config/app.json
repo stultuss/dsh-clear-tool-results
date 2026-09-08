@@ -1,0 +1,19 @@
+{
+  "service": "edge-scheduler",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8321
+  },
+  "gate": {
+    "enabled": true,
+    "flag": "gamma-9"
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  },
+  "annotations": {
+    "owner": "platform-team",
+    "reviewed": false
+  }
+}
