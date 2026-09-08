@@ -174,7 +174,19 @@ async function onTurnEnd(ctx, session, endedTurn) {
   clearCompletedToolResults(session, endedTurn)
 }
 
+/** 记录每个会话在上一次 turn/start 时看到的系列代次，用于补齐缺失的每轮边界。 */
+const lastSeriesGeneration = new WeakMap()
+
 async function onTurnStart(ctx, session, turn) {
+  // 先做同步兜底（不 await，尽量赶在首条请求组装之前），再进入需要异步读盘的归档流程。
+  // overclock 需要每轮恰好一次系列边界：若上一轮结束时没有产生边界（空轮、被中断的轮），
+  // 在这里补一次内容不变的替换。仅当核心补丁提供 seriesGeneration 时启用，
+  // 否则旧核心会把这次替换当成新系列，重新造成每步重复展示。
+  if (readStateSync().mode === MODE_OVERCLOCK && supportsSeriesGeneration(session)) {
+    const generation = session.surface.seriesGeneration
+    if (lastSeriesGeneration.get(session) === generation) nudgeSeries(session, turn)
+    lastSeriesGeneration.set(session, session.surface.seriesGeneration)
+  }
   if (!(await readEnabled())) return
   const logsDir = logsDirOf(ctx, session)
   await enqueue(session.id, async () => {
@@ -289,16 +301,31 @@ function clearStepToolResults(session, turn, step) {
 /** 标记「本次清除属于逐步清除」：仅此时给 replace 打 impact:"clear"。 */
 let stepClearInProgress = false
 
-/** 内容不变地替换本轮最后一个 tool/result，用于制造一次系列边界。 */
+/**
+ * 内容不变地替换一个 tool/result，用于制造一次系列边界。
+ * 优先取本轮最后一个；本轮没有工具结果（空轮、被中断的轮）时退化为会话里最近的一条：
+ * 内容不变地替换不改变历史展示，但同样只产生一次系列边界。
+ */
 function nudgeSeries(session, turn) {
   const events = eventsOf(session)
   const nodes = [...session.surface.nodes]
+  let fallbackSeq = -1
+  let fallbackEvent = null
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const seq = nodes[index]
     const event = events[seq]
     if (!event || event.type !== TOOL_RESULT) continue
-    if (event.data?.turn !== turn) continue
-    replaceToolResult(session, seq, event.data, placeholderTextOf(event.data.message))
+    if (event.data?.turn === turn) {
+      replaceToolResult(session, seq, event.data, placeholderTextOf(event.data.message))
+      return true
+    }
+    if (fallbackEvent === null) {
+      fallbackSeq = seq
+      fallbackEvent = event
+    }
+  }
+  if (fallbackEvent !== null) {
+    replaceToolResult(session, fallbackSeq, fallbackEvent.data, placeholderTextOf(fallbackEvent.data.message))
     return true
   }
   return false

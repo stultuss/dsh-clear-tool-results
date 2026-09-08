@@ -2,6 +2,18 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。
 
+## [0.5.2] - 2026-09-08
+
+### 修复
+
+- **overclock 下"每轮一次系统提示词"漏发**：若某一轮没有工具结果（空轮）或被中断（没有 `turn/end`），轮末不会产生普通 replace，`seriesGeneration` 不变，下一轮首条请求便不会 append `request/header{reason:"series"}`，Chat 该轮完全不显示系统提示词。现在两处兜底：
+  - `nudgeSeries` 在本轮没有工具结果时退化为替换会话里最近的一条（内容不变，不影响历史展示）；
+  - `turn/start` 增加兜底：仅当核心已提供 `seriesGeneration`、且自上次 `turn/start` 起代次未变化时，补一次内容不变的替换，保证每轮恰好一次系列边界。
+
+### 变更
+
+- CHANGELOG 中 0.5.1 记录的补丁路径更正为 `patches/patch-core.mjs`（该文件从 `scripts/` 移出，因为 `scripts` 被 .gitignore 忽略）。
+
 ## [0.5.1] - 2026-09-08
 
 ### 新增
@@ -14,7 +26,7 @@
 ### 变更
 
 - `replaceToolResult` 增加 `clearOnly` 参数；`clearToolResultsWhere` 返回清除数量。
-- 补丁资产位于本仓库：`scripts/patch-core.mjs`（应用/回退/状态）与 `patches/README.md`（原理与用法）。
+- 补丁资产位于本仓库：`patches/patch-core.mjs`（应用/回退/状态）与 `patches/README.md`（原理与用法）。
 
 ## [0.5.0] - 2026-09-08
 

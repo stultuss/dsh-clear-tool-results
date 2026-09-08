@@ -136,7 +136,7 @@ cat ~/.dsh/sessions/*/*/tool-result-logs/round-0001-step-0001.json
 2. `dsh plugin --profile web remove dsh-clear-tool-results`；
 3. 可选：删除 `$DSH_HOME/clear-tool-results.json` 与各 `tool-result-logs/` 目录。
 
-## 修复提示词 UI 重复展示补丁（0.5.1，overclock 专用）
+## 修复提示词 UI 重复展示补丁（0.5.1+，overclock 专用）
 
 overclock 每步都会用 surface `replace` 清除上一步结果，而核心对**每次** replace 都递增
 `replaceGeneration`；`dsh-agent-loop` 用它判断「两次请求之间 surface 被改写过」，于是每步都
@@ -157,6 +157,10 @@ npm run patch:status   # 状态
 npm run patch:apply    # 应用（自动备份到 ~/.dsh/clear-tool-results-backups/）
 npm run patch:revert   # 回退
 ```
+
+打补丁后的边界语义：每轮**恰好一次**系列边界——轮末的普通 replace（清除本轮剩余结果；空轮或
+被中断的轮则由 `nudgeSeries` 做一次内容不变的替换）使 `seriesGeneration` +1，下一轮首条请求
+才会 append 一次 `request/header`，于是 Chat 每轮只展示一次（可折叠的）系统提示词。
 
 补丁写入的是磁盘上的核心文件，**必须重启 dsh GUI 进程**才会生效；核心升级/重装后重新
 `npm run patch:apply` 即可。原理与注意事项见 `patches/README.md`。
