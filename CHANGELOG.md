@@ -2,6 +2,20 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。
 
+## [0.5.1] - 2026-09-08
+
+### 新增
+
+- **核心补丁（方案 C）与命令绑定**：overclock 的每步清除此前会让 Chat 界面每步重复展示一次系统提示词——因为核心对每次 surface `replace` 都递增 `replaceGeneration`，而 `dsh-agent-loop` 据此判定“新系列”并 append `request/header {reason:"series"}`。
+  现在新增 `scripts/patch-core.mjs`（`npm run patch:status|apply|revert`），对核心做**双代数**小改动：保留 `replaceGeneration` 原语义，新增只对“非清除型 replace”递增的 `seriesGeneration`；agent-loop 的系列判定改读后者（缺失时回退前者，可独立应用/回退）。
+  补丁与命令联动：`/clear-tool-results overclock` 自动 apply、`on`/`off` 自动 revert、`status` 显示补丁状态。补丁写入磁盘后需重启 dsh GUI 生效。
+- 插件逐步清除时给 `surfaceOp` 打 `impact:"clear"`（仅在探测到核心已暴露 `seriesGeneration` 时），轮末清除保持普通 replace 并新增 `nudgeSeries` 兜底，保证 Chat 每轮恰好展示一次系统提示词。
+
+### 变更
+
+- `replaceToolResult` 增加 `clearOnly` 参数；`clearToolResultsWhere` 返回清除数量。
+- 补丁资产位于本仓库：`scripts/patch-core.mjs`（应用/回退/状态）与 `patches/README.md`（原理与用法）。
+
 ## [0.5.0] - 2026-09-08
 
 - overclock：每轮第一条清除占位符附带“可见性规则”扩展说明（逐步可见、取回内容同样只存活一步、需要精确原文时用前再取、总结引用多步前可整轮取回一次）；其余占位符保持短文本，控制常驻上下文开销。

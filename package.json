@@ -1,6 +1,6 @@
 {
   "name": "dsh-clear-tool-results",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "author": "stultuss",
   "description": "DeepSeek Harness host plugin: archive raw tool results into the session folder, clear them from the visible conversation at round boundaries (or per-step in overclock mode), and let the model recall them through a read_tool_result_log(turn, step) tool.",
   "homepage": "https://github.com/stultuss/dsh-clear-tool-results#readme",
@@ -24,9 +24,16 @@
   "files": [
     "index.mjs",
     "cordis.patch.yml",
+    "patches/patch-core.mjs",
+    "patches/README.md",
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "patch:status": "node patches/patch-core.mjs status",
+    "patch:apply": "node patches/patch-core.mjs apply",
+    "patch:revert": "node patches/patch-core.mjs revert"
+  },
   "keywords": [
     "dsh",
     "deepseek-harness",

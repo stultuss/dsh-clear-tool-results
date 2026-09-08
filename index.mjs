@@ -38,6 +38,54 @@ const INDEX_FILE = 'index.json'
 const STATE_FILE = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'clear-tool-results.json')
 const SESSIONS_ROOT = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'sessions')
 
+/** 载入核心补丁管理器（与本插件同仓库）；不可用时返回 null。 */
+async function loadPatchManager() {
+  try {
+    return await import(new URL('./patches/patch-core.mjs', import.meta.url).href)
+  } catch {
+    return null
+  }
+}
+
+/** overclock 需要核心补丁，round/off 不需要；返回可拼进命令回复的一行说明。 */
+async function syncCorePatch(action) {
+  const manager = await loadPatchManager()
+  if (!manager) return '（未找到补丁管理器 patches/patch-core.mjs，可手动运行 npm run patch:apply）'
+  try {
+    const root = manager.resolveCoreRoot()
+    if (!root) return '（未定位到 dsh 核心目录，可手动运行 npm run patch:apply -- --root <dsh 目录>）'
+    if (action === 'apply') {
+      const result = manager.applyPatches(root)
+      return result.changed ? '；核心补丁已应用，重启 dsh GUI 后生效' : '；核心补丁已处于应用状态'
+    }
+    const result = manager.revertPatches(root)
+    return result.changed ? '；核心补丁已回退，重启 dsh GUI 后生效' : '；核心补丁未应用，无需回退'
+  } catch (error) {
+    return `（补丁操作失败：${String(error?.message ?? error)}；可手动运行 npm run patch:apply 或 patch:revert）`
+  }
+}
+
+/** status 命令用的补丁状态行。 */
+async function corePatchStatusLine() {
+  const manager = await loadPatchManager()
+  if (!manager) return '\n核心补丁：未知（未找到 patches/patch-core.mjs）'
+  try {
+    const root = manager.resolveCoreRoot()
+    if (!root) return '\n核心补丁：未知（未定位到 dsh 核心目录）'
+    const status = manager.patchStatus(root)
+    const label = status.applied
+      ? '已应用'
+      : status.files.every((file) => file.state === 'absent') ? '未应用' : '不完整'
+    const detail = status.files
+      .map((file) => `${file.rel.includes('agent-loop') ? 'agent-loop' : 'session'}=${file.state}`)
+      .join(' ')
+    const hint = status.applied ? '' : '；overclock 模式建议应用补丁（命令会自动处理）'
+    return `\n核心补丁：${label}（${detail}）${hint}`
+  } catch (error) {
+    return `\n核心补丁：检测失败（${String(error?.message ?? error)}）`
+  }
+}
+
 export function apply(ctx) {
   const disposers = []
   disposers.push(ctx.commands.register({
@@ -48,27 +96,30 @@ export function apply(ctx) {
     handler: async ({ rawInput, agent }) => {
       const arg = rawInput.trim().toLowerCase()
       if (arg === 'on') {
+        const patchNote = await syncCorePatch('revert')
         await writeState({ enabled: true, mode: MODE_ROUND })
         if (agent?.session) {
           queueMicrotask(() => {
             enableNow(ctx, agent.session).catch((error) => ctx.logger.warn('dsh-clear-tool-results: ' + String(error)))
           })
         }
-        return { kind: 'success', text: '已启用（普通模式）：工具结果按轮归档，并在下一轮开始前从对话清除' }
+        return { kind: 'success', text: '已启用（普通模式）：工具结果按轮归档，并在下一轮开始前从对话清除' + patchNote }
       }
       if (arg === 'overclock') {
+        const patchNote = await syncCorePatch('apply')
         await writeState({ enabled: true, mode: MODE_OVERCLOCK })
         if (agent?.session) {
           queueMicrotask(() => {
             enableNow(ctx, agent.session).catch((error) => ctx.logger.warn('dsh-clear-tool-results: ' + String(error)))
           })
         }
-        return { kind: 'success', text: '已启用（overclock 模式）：每一步工具结果归档后滞后一步清除，更早步骤需 read_tool_result_log(turn, step) 取回' }
+        return { kind: 'success', text: '已启用（overclock 模式）：每一步工具结果归档后滞后一步清除，更早步骤需 read_tool_result_log(turn, step) 取回' + patchNote }
       }
       if (arg === 'off') {
+        const patchNote = await syncCorePatch('revert')
         const state = await readState()
         await writeState({ enabled: false, mode: state.mode })
-        return { kind: 'success', text: '已禁用：工具结果保留在对话中，不再归档' }
+        return { kind: 'success', text: '已禁用：工具结果保留在对话中，不再归档' + patchNote }
       }
       if (arg === 'status') {
         const state = await readState()
@@ -76,7 +127,7 @@ export function apply(ctx) {
         const text = state.enabled
           ? `当前状态：已启用（${modeText}）`
           : `当前状态：已禁用（上次模式：${modeText}）`
-        return { kind: 'success', text }
+        return { kind: 'success', text: text + (await corePatchStatusLine()) }
       }
       return { kind: 'error', text: '用法：/clear-tool-results on|off|status|overclock' }
     },
@@ -192,6 +243,7 @@ function clearToolResultsWhere(session, matches) {
   const nodes = [...session.surface.nodes]
   const overclock = readStateSync().mode === MODE_OVERCLOCK
   const hintedThisCall = new Set()
+  let cleared = 0
   for (const seq of nodes) {
     const original = eventsOf(session)[seq]
     if (!original || original.type !== TOOL_RESULT) continue
@@ -210,18 +262,55 @@ function clearToolResultsWhere(session, matches) {
       extendedHintRounds.add(key)
       hintedThisCall.add(key)
     }
-    replaceToolResult(session, seq, data, clearedText(turn, step, extended))
+    replaceToolResult(session, seq, data, clearedText(turn, step, extended), stepClearInProgress)
+    cleared += 1
   }
+  return cleared
 }
 
 /** 将轮次 <= untilTurn 的 tool/result 节点替换为占位符。 */
 function clearCompletedToolResults(session, untilTurn) {
-  clearToolResultsWhere(session, (data) => typeof data?.turn === 'number' && data.turn <= untilTurn)
+  const cleared = clearToolResultsWhere(session, (data) => typeof data?.turn === 'number' && data.turn <= untilTurn)
+  // overclock 的逐步清除不开启新系列；轮末再补一次普通替换，让下一轮仍有一个系列边界
+  // （Chat 每轮展示一次系统提示词）。逐步清除已把结果清空时同样需要这个边界。
+  if (cleared === 0 && readStateSync().mode === MODE_OVERCLOCK) nudgeSeries(session, untilTurn)
 }
 
-/** overclock：将第 turn 轮第 step 步的工具结果替换为占位符。 */
+/** overclock：将第 turn 轮第 step 步的工具结果替换为占位符（清除型，不开启新系列）。 */
 function clearStepToolResults(session, turn, step) {
-  clearToolResultsWhere(session, (data) => data?.turn === turn && data?.step === step)
+  stepClearInProgress = true
+  try {
+    clearToolResultsWhere(session, (data) => data?.turn === turn && data?.step === step)
+  } finally {
+    stepClearInProgress = false
+  }
+}
+
+/** 标记「本次清除属于逐步清除」：仅此时给 replace 打 impact:"clear"。 */
+let stepClearInProgress = false
+
+/** 内容不变地替换本轮最后一个 tool/result，用于制造一次系列边界。 */
+function nudgeSeries(session, turn) {
+  const events = eventsOf(session)
+  const nodes = [...session.surface.nodes]
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const seq = nodes[index]
+    const event = events[seq]
+    if (!event || event.type !== TOOL_RESULT) continue
+    if (event.data?.turn !== turn) continue
+    replaceToolResult(session, seq, event.data, placeholderTextOf(event.data.message))
+    return true
+  }
+  return false
+}
+
+/** 从占位符消息里取出纯文本，保证 nudgeSeries 的替换内容与现状一致。 */
+function placeholderTextOf(message) {
+  const first = message?.content?.[0]
+  if (!first) return ''
+  if (first.type === 'text') return first.text ?? ''
+  const inner = first.content?.[0]
+  return inner?.text ?? ''
 }
 
 function clearedText(turn, step, extended) {
@@ -746,14 +835,22 @@ function toolNameOf(data, nameByCallId) {
     ?? UNKNOWN_TOOL
 }
 
-function replaceToolResult(session, seq, data, text) {
+function replaceToolResult(session, seq, data, text, clearOnly = false) {
+  const surfaceOp = { op: 'replace', start: seq, end: seq }
+  // 仅当核心已打 seriesGeneration 补丁时才带 impact：旧核心的 isReplaceOp 只接受 3 个键
+  if (clearOnly && supportsSeriesGeneration(session)) surfaceOp.impact = 'clear'
   session.append(TOOL_RESULT, {
     ...data,
     message: clearedMessage(data.message, text),
   }, {
-    surfaceOp: { op: 'replace', start: seq, end: seq },
+    surfaceOp,
     sourceEventSeqs: [seq],
   })
+}
+
+/** 核心补丁（seriesGeneration 双代数）是否已在当前进程生效。 */
+function supportsSeriesGeneration(session) {
+  return typeof session?.surface?.seriesGeneration === 'number'
 }
 
 function clearedMessage(message, text) {

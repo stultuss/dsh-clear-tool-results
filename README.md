@@ -36,12 +36,37 @@ dsh plugin --profile web add dsh-clear-tool-results
 
 | 命令 | 效果 |
 | --- | --- |
-| `/clear-tool-results on` | 启用普通模式：每轮归档 + 轮末清除 |
-| `/clear-tool-results overclock` | 启用激进模式：每步即时归档 + 滞后一步清除 |
-| `/clear-tool-results off` | 停用：保留工具结果，不再归档 |
-| `/clear-tool-results status` | 查看当前状态（启用与否 + 模式） |
+| `/clear-tool-results on` | 启用普通模式：每轮归档 + 轮末清除（自动回退核心补丁） |
+| `/clear-tool-results overclock` | 启用激进模式：每步即时归档 + 滞后一步清除（自动应用核心补丁） |
+| `/clear-tool-results off` | 停用：保留工具结果，不再归档（自动回退核心补丁） |
+| `/clear-tool-results status` | 查看当前状态（启用与否 + 模式 + 核心补丁状态） |
 
 模式切换建议在轮次之间进行；轮中途切换时新规则只对之后的步骤生效，已经清除的结果保持占位符（原始数据可在日志中读取）。
+
+## 核心补丁（0.5.1，overclock 专用）
+
+overclock 每步都会用 surface `replace` 清除上一步结果，而核心对**每次** replace 都递增
+`replaceGeneration`；`dsh-agent-loop` 用它判断「两次请求之间 surface 被改写过」，于是每步都
+append 一个 `request/header {reason:"series"}`，Chat 界面就为每个系列渲染一次系统提示词——
+表现为**每步重复展示**。
+
+插件侧无法规避（surface 只有 `append` 与 `replace` 两种操作，清除必须 replace），因此提供
+一个可选的核心小补丁（**双代数**）：
+
+- `dsh-session`：新增 `seriesGeneration`，只有「非清除型 replace」才递增；`replaceGeneration` 语义不变
+  （模型上下文投影缓存、压缩轮询、客户端镜像都继续依赖它）。
+- `dsh-agent-loop`：系列判定改读 `seriesGeneration`（缺失时回退 `replaceGeneration`，可独立应用/回退）。
+
+补丁与命令绑定：`overclock` 自动应用、`on`/`off` 自动回退、`status` 显示状态。也可以手动执行：
+
+```sh
+npm run patch:status   # 状态
+npm run patch:apply    # 应用（自动备份到 patches/backups/）
+npm run patch:revert   # 回退
+```
+
+补丁写入的是磁盘上的核心文件，**必须重启 dsh GUI 进程**才会生效；核心升级/重装后重新
+`npm run patch:apply` 即可。原理与注意事项见 `patches/README.md`。
 
 ## 功能
 
