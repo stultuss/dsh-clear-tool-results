@@ -129,117 +129,187 @@ export function ptcItems(sessionId, turn, step) {
 }
 
 /** 登记一条刚被清除的结果：原文只在这里读一次，之后靠记号判断是否被转述/复用。 */
-export function recordCleared(sessionId, info) {
+export function recordResult(sessionId, info) {
   try {
     const book = bookOf(sessionId)
-    const text = String(info && info.text ? info.text : '')
-    book.entries.push({
-      turn: info && info.turn,
-      step: info && info.step,
-      tool: (info && info.tool) || '?',
-      callKey: (info && info.callKey) || null,
+    const turn = numberOrNull(info?.turn)
+    const step = numberOrNull(info?.step)
+    const callKey = info?.callKey ? String(info.callKey) : null
+    const dup = book.entries.find(
+      (entry) => entry.turn === turn && entry.step === step && (callKey ? entry.callKey === callKey : true),
+    )
+    if (dup) return dup
+    const text = String(info?.text ?? '')
+    const entry = {
+      turn,
+      step,
+      tool: String(info?.tool ?? ''),
+      callKey,
       chars: text.length,
       tokens: tokens(text),
-      hit: null,
       at: Date.now(),
-    })
-    const entry = book.entries[book.entries.length - 1]
-    for (const token of entry.tokens) book.df.set(token, (book.df.get(token) || 0) + 1)
-    if (book.entries.length > MAX_ENTRIES) {
-      book.entries.splice(0, book.entries.length - MAX_ENTRIES)
-      rebuildDf(book)
+      cleared: false,
+      commonSeen: false,
+      hit: null,
+      hitAt: null,
+      hitTurn: null,
+      hitStep: null,
+      channels: [],
     }
-    book.stats.cleared++
+    book.entries.push(entry)
+    while (book.entries.length > MAX_ENTRIES) book.entries.shift()
+    rebuildDf(book)
+    return entry
   } catch {
-    // 埋点失败绝不能影响清除本身
+    return null
   }
 }
+
+function numberOrNull(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/** first hit wins for channel/hitTurn/hitStep; later hits only append to channels */
+function stamp(entry, channel, ref) {
+  if (!entry.channels) entry.channels = []
+  if (!entry.channels.includes(channel)) entry.channels.push(channel)
+  if (entry.hit) return false
+  entry.hit = channel
+  entry.hitAt = Date.now()
+  entry.hitTurn = numberOrNull(ref?.turn)
+  entry.hitStep = numberOrNull(ref?.step)
+  return true
+}
+
+export function markCleared(sessionId, info) {
+  try {
+    const book = bookOf(sessionId)
+    const turn = numberOrNull(info?.turn)
+    const step = numberOrNull(info?.step)
+    const callKey = info?.callKey ? String(info.callKey) : null
+    let entry = callKey
+      ? book.entries.find((item) => item.turn === turn && item.step === step && item.callKey === callKey)
+      : null
+    if (!entry) {
+      const same = book.entries.filter((item) => item.turn === turn && item.step === step && !item.cleared)
+      if (same.length === 1) entry = same[0]
+    }
+    if (!entry) entry = recordResult(sessionId, info)
+    if (entry && !entry.cleared) {
+      entry.cleared = true
+      book.stats.cleared = (book.stats.cleared ?? 0) + 1
+    }
+    return entry
+  } catch {
+    return null
+  }
+}
+
+function match(book, entry, found) {
+  if (!entry.tokens || entry.tokens.length === 0) return 'none'
+  let hit = false
+  for (const token of entry.tokens) {
+    if (!found.has(token)) continue
+    hit = true
+    if (isRare(book, token)) return 'rare'
+  }
+  return hit ? 'common' : 'none'
+}
+
+function touch(book, found, channel, ref) {
+  let hits = 0
+  for (const entry of book.entries) {
+    const verdict = match(book, entry, found)
+    if (verdict === 'none') continue
+    if (verdict === 'common') {
+      entry.commonSeen = true
+      continue
+    }
+    if (stamp(entry, channel, ref)) hits += 1
+  }
+  return hits
+}
+
+
+
+
+function summarize(book) {
+  const channels = {}
+  let cleared = 0
+  let attributed = 0
+  let common = 0
+  let window = 0
+  for (const entry of book.entries) {
+    if (!entry.cleared) continue
+    cleared += 1
+    if (entry.hit) {
+      attributed += 1
+      channels[entry.hit] = (channels[entry.hit] ?? 0) + 1
+      if (entry.hitTurn !== null && entry.hitTurn === entry.turn && entry.hitStep === (entry.step ?? -9) + 1) window += 1
+    } else if (entry.commonSeen) {
+      common += 1
+    }
+  }
+  return { results: book.entries.length, cleared, attributed, none: cleared - attributed - common, common, window, channels }
+}
+
+
 
 /** 助手消息里的"具体事实"重现：每条结果只记第一次命中的渠道。 */
-export function attributeText(sessionId, text, channel) {
+export function attributeText(sessionId, text, channel, ref) {
   try {
-    const book = books.get(sessionId)
-    if (!book || !text || text.length < 24) return
-    // 只对消息分词一次，后续用 Set 命中：避免 entries × tokens 次长文本扫描（事件热路径）
-    const present = new Set(String(text).match(TOKEN_RE) || [])
-    for (const entry of book.entries) {
-      if (entry.hit || entry.tokens.length === 0) continue
-      const matched = entry.tokens.filter((token) => present.has(token))
-      if (matched.length === 0) continue
-      if (matched.some((token) => isRare(book, token))) {
-        entry.hit = channel
-        entry.hitAt = Date.now()
-        book.stats[channel] = (book.stats[channel] || 0) + 1
-      } else if (!entry.commonSeen) {
-        // 只有样板词命中：不算复用证据，条目留着等稀有记号（避免被工作区路径这种词提前吃掉）
-        entry.commonSeen = true
-        book.stats.common = (book.stats.common || 0) + 1
-      }
-    }
+    if (!text) return 0
+    const book = bookOf(sessionId)
+    const found = new Set(tokens(String(text)))
+    if (found.size === 0) return 0
+    return touch(book, found, channel, ref)
   } catch {
-    // 忽略
+    return 0
   }
 }
-
 /** 工具调用：同参重跑 -> rerun（并挂一条一次性提示）；用上早先的具体值 -> reuseArgs。 */
-export function attributeCall(sessionId, toolName, argsString) {
+export function attributeCall(sessionId, toolName, argsString, ref) {
   try {
-    const book = books.get(sessionId)
-    if (!book) return
-    const key = callKeyOf(toolName, argsString)
-    const text = String(argsString == null ? '' : argsString)
-    const present = text.length >= 24 ? new Set(text.match(TOKEN_RE) || []) : new Set()
-    for (const entry of book.entries) {
-      if (entry.hit) continue
-      if (entry.callKey && entry.callKey === key) {
-        entry.hit = 'rerun'
-        entry.hitAt = Date.now()
-        book.stats.rerun = (book.stats.rerun || 0) + 1
-        const known = book.hints.some((h) => h.turn === entry.turn && h.step === entry.step)
-        if (book.hints.length < MAX_HINTS && !known) book.hints.push({ turn: entry.turn, step: entry.step, tool: entry.tool })
-        continue
-      }
-      if (present.size === 0) continue
-      const matched = entry.tokens.filter((token) => present.has(token))
-      if (matched.length === 0) continue
-      if (matched.some((token) => isRare(book, token))) {
-        entry.hit = 'reuseArgs'
-        entry.hitAt = Date.now()
-        book.stats.reuseArgs = (book.stats.reuseArgs || 0) + 1
-      } else if (!entry.commonSeen) {
-        entry.commonSeen = true
-        book.stats.common = (book.stats.common || 0) + 1
-      }
-    }
-  } catch {
-    // 忽略
-  }
-}
-
-/** 取回命中：把引用到的轮/步标成 read。 */
-export function markRead(sessionId, ref) {
-  try {
-    const book = books.get(sessionId)
-    if (!book) return 0
+    const book = bookOf(sessionId)
+    const name = String(toolName ?? '')
+    const text = String(argsString ?? '')
+    const found = new Set(tokens(text))
+    if (found.size === 0) return 0
+    const key = callKeyOf(name, text)
     let hits = 0
     for (const entry of book.entries) {
-      if (entry.hit) continue
-      const byStep = ref && typeof ref.turn === 'number' && typeof ref.step === 'number' && entry.turn === ref.turn && entry.step === ref.step
-      const byTurn = ref && typeof ref.turn === 'number' && typeof ref.step !== 'number' && entry.turn === ref.turn
-      const byTime = ref && typeof ref.time === 'number' && Math.abs((entry.at || 0) - ref.time) < 60000
-      if (byStep || byTurn || byTime) {
-        entry.hit = 'read'
-        entry.hitAt = Date.now()
-        book.stats.read = (book.stats.read || 0) + 1
-        hits++
+      const verdict = match(book, entry, found)
+      if (verdict === 'none') continue
+      if (verdict === 'common') {
+        entry.commonSeen = true
+        continue
       }
+      const channel = entry.callKey && key && entry.callKey === key ? 'rerun' : 'reuseArgs'
+      if (stamp(entry, channel, ref)) hits += 1
     }
     return hits
   } catch {
     return 0
   }
 }
-
+/** 取回命中：把引用到的轮/步标成 read。 */
+export function markRead(sessionId, ref, cursor) {
+  try {
+    const book = bookOf(sessionId)
+    const turn = numberOrNull(ref?.turn)
+    const step = numberOrNull(ref?.step)
+    const at = cursor && typeof cursor.turn === 'number' ? cursor : ref
+    let hits = 0
+    for (const entry of book.entries) {
+      if (turn !== null && entry.turn !== turn) continue
+      if (step !== null && entry.step !== step) continue
+      if (stamp(entry, 'read', at)) hits += 1
+    }
+    return hits
+  } catch {
+    return 0
+  }
+}
 /** 取走待注入的重跑提示（一次性，最多两条）。 */
 export function takeHint(sessionId) {
   try {
@@ -286,55 +356,53 @@ export function indexText(items) {
   }
 }
 
-function noneCount(stats) {
-  const attributed = CHANNELS.reduce((sum, channel) => sum + (stats[channel] || 0), 0)
-  return Math.max(0, (stats.cleared || 0) - attributed)
-}
 
 /** status 命令里显示的一行汇总。 */
 export function summaryText(sessionId) {
   try {
-    const book = books.get(sessionId)
-    if (!book || (book.stats.cleared || 0) === 0) return null
-    const stats = book.stats
-    const pct = (n) => Math.round((100 * n) / Math.max(1, stats.cleared)) + '%'
-    return [
-      '会话归因：清除 ' + stats.cleared + ' 条',
-      '取回 ' + (stats.read || 0) + '(' + pct(stats.read || 0) + ')',
-      '重跑 ' + (stats.rerun || 0) + '(' + pct(stats.rerun || 0) + ')',
-      '转述·文本 ' + (stats.carryText || 0) + '(' + pct(stats.carryText || 0) + ')',
-      '转述·推理 ' + (stats.carryReasoning || 0) + '(' + pct(stats.carryReasoning || 0) + ')',
-      '参数复用 ' + (stats.reuseArgs || 0) + '(' + pct(stats.reuseArgs || 0) + ')',
-      '样板词命中 ' + (stats.common || 0) + '(' + pct(stats.common || 0) + ')',
-      '未再用 ' + noneCount(stats) + '(' + pct(noneCount(stats)) + ')',
-    ].join('，')
+    const stats = summarize(bookOf(sessionId))
+    const total = stats.cleared > 0 ? stats.cleared : 1
+    const share = (n) => '(' + Math.round((n / total) * 100) + '%)'
+    const count = (name) => stats.channels[name] ?? 0
+    return (
+      '归因 已清除 ' + stats.cleared + ' 条：命中 ' + stats.attributed +
+      '（可见窗口内 ' + stats.window + '）  取回 ' + count('read') + share(count('read')) +
+      '  重跑 ' + count('rerun') + share(count('rerun')) +
+      '  转述·文本 ' + count('carryText') + share(count('carryText')) +
+      '  转述·推理 ' + count('carryReasoning') + share(count('carryReasoning')) +
+      '  参数复用 ' + count('reuseArgs') + share(count('reuseArgs')) +
+      '，样板词命中 ' + stats.common + share(stats.common) + '，未复用 ' + stats.none
+    )
   } catch {
-    return null
+    return ''
   }
-}
-
-/** 写 <logsDir>/usage.json（每轮末一次）。不做兜底：写失败要让调用方看见并记录。 */
+}/** 写 <logsDir>/usage.json（每轮末一次）。不做兜底：写失败要让调用方看见并记录。 */
 export async function persist(sessionId, logsDir) {
-  {
-    const book = books.get(sessionId)
-    if (!book || (book.stats.cleared || 0) === 0) return null
-    const payload = {
-      schemaVersion: 2,
-      sessionId,
-      updatedAt: Date.now(),
-      stats: Object.assign({}, book.stats, { none: noneCount(book.stats) }),
-      entries: book.entries.map((entry) => ({
-        turn: entry.turn,
-        step: entry.step,
-        tool: entry.tool,
-        chars: entry.chars,
-        channel: entry.hit || (entry.commonSeen ? 'common' : 'none'),
-        channelAt: entry.hitAt || null,
-      })),
-    }
-    const file = join(logsDir, USAGE_FILE)
-    await mkdir(logsDir, { recursive: true })
-    await writeFile(file, JSON.stringify(payload, null, 2), 'utf8')
-    return file
+  const book = bookOf(sessionId)
+  const stats = summarize(book)
+  if (stats.cleared === 0 && book.entries.length === 0) return null
+  const payload = {
+    schemaVersion: 3,
+    sessionId,
+    updatedAt: Date.now(),
+    stats,
+    entries: book.entries.map((entry) => ({
+      turn: entry.turn,
+      step: entry.step,
+      tool: entry.tool,
+      callKey: entry.callKey,
+      chars: entry.chars,
+      cleared: entry.cleared,
+      channel: entry.hit,
+      channels: (entry.channels ?? []).slice(),
+      hitTurn: entry.hitTurn,
+      hitStep: entry.hitStep,
+      common: !!entry.commonSeen,
+    })),
+    hints: book.hints.slice(),
   }
+  const file = join(logsDir, USAGE_FILE)
+  await mkdir(logsDir, { recursive: true })
+  await writeFile(file, JSON.stringify(payload, null, 2) + '\n', 'utf8')
+  return file
 }

@@ -18,6 +18,19 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import * as usage from './usage.mjs'
 
+// 归因埋点用的"当前位置"游标：markRead 需要知道这次取回发生在第几轮第几步（0.6.6）
+const sessionCursor = new Map()
+
+/** 归因埋点用：事件所在的轮/步。 */
+function eventRef(event) {
+  const turn = event?.data?.turn
+  const step = event?.data?.step
+  return {
+    turn: typeof turn === 'number' ? turn : null,
+    step: typeof step === 'number' ? step : null,
+  }
+}
+
 export const name = 'dsh-clear-tool-results'
 export const inject = ['commands', 'tools', 'sessionPersistence']
 
@@ -209,6 +222,26 @@ export function apply(ctx) {
       queueMicrotask(() => {
         onStepEnd(ctx, session, turn, step).catch((error) => warn(ctx, String(error)))
       })
+    } else if (event.type === 'tool/result') {
+      // 归因埋点（只观测，0.6.6）：结果一到就登记条目。此前条目在"清除时"才建立，而清除发生在紧随
+      // 其后的那一步结束之后 —— 于是"看完就用"（可见窗口内的复用）永远无从归因，会被记成 none。
+      try {
+        const data = event.data
+        const info = describeClearedResult(session, data)
+        const text = String(info?.text ?? '')
+        if (!(text.startsWith('[第 ') && text.includes('已清除归档'))) {
+          sessionCursor.set(session.id, { turn: data?.turn ?? null, step: data?.step ?? null })
+          usage.recordResult(session.id, {
+            turn: data?.turn,
+            step: data?.step,
+            tool: info?.tool,
+            callKey: info?.callKey,
+            text,
+          })
+        }
+      } catch (error) {
+        warn(ctx, '归因埋点失败 ' + String(error))
+      }
     } else if (event.type === 'assistant/message') {
       // 归因埋点（只观测，见 usage.mjs）：结果被清除后，具体事实是否被转述进推理/可见文本
       try {
@@ -220,15 +253,19 @@ export function apply(ctx) {
           else if (typeof part === 'string') text += part
           else if (part.text) text += String(part.text)
         }
-        usage.attributeText(session.id, text, 'carryText')
-        usage.attributeText(session.id, reasoning, 'carryReasoning')
+        const ref = eventRef(event)
+        sessionCursor.set(session.id, ref)
+        usage.attributeText(session.id, text, 'carryText', ref)
+        usage.attributeText(session.id, reasoning, 'carryReasoning', ref)
       } catch (error) {
         warn(ctx, '归因埋点失败 ' + String(error))
       }
     } else if (event.type === 'tool/call') {
       // 归因埋点（只观测）：同参重跑 -> rerun；用上早先结果里的具体值 -> reuseArgs
       try {
-        usage.attributeCall(session.id, event.data?.name, usage.argsText(event.data?.arguments))
+        const ref = eventRef(event)
+        sessionCursor.set(session.id, ref)
+        usage.attributeCall(session.id, event.data?.name, usage.argsText(event.data?.arguments), ref)
       } catch (error) {
         warn(ctx, '归因埋点失败 ' + String(error))
       }
@@ -424,7 +461,7 @@ function clearToolResultsWhere(session, matches) {
     const info = describeClearedResult(session, data)
     try {
       replaceToolResult(session, seq, data, clearedText(turn, step, extended, info.index, usage.takeHint(session.id)))
-      usage.recordCleared(session.id, { turn, step, tool: info.tool, callKey: info.callKey, text: info.text })
+      usage.markCleared(session.id, { turn, step, tool: info.tool, callKey: info.callKey, text: info.text })
       cleared += 1
     } catch (error) {
       warn(null, `清除失败（目标 seq ${seq} 已不在 surface 或写入被拒）：${String(error?.message ?? error)}`)
@@ -934,7 +971,11 @@ function readToolResultLogTool(ctx) {
           '取回提示（overclock）：归档内容同样只在紧随其后的下一步决策中可见，请立即使用；若总结需引用多步原文，建议总结前按轮整轮取回一次。'
         // 归因埋点（只观测）：这次取回命中了哪些轮/步，用来统计"取回"渠道的真实占比
         try {
-          usage.markRead(session.id, { turn: result.turn, step: result.step, time: result.timeFrom })
+          usage.markRead(
+            session.id,
+            { turn: result.turn, step: result.step, time: result.timeFrom },
+            sessionCursor.get(session.id),
+          )
         } catch {
           // 忽略
         }
