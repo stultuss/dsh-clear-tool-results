@@ -25,14 +25,17 @@
     "index.mjs",
     "cordis.patch.yml",
     "patches/patch-core.mjs",
+    "patches/check-harness-compat.mjs",
     "patches/README.md",
+    "scripts/check-harness-compat.mjs",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "patch:status": "node patches/patch-core.mjs status",
     "patch:apply": "node patches/patch-core.mjs apply",
-    "patch:revert": "node patches/patch-core.mjs revert"
+    "patch:revert": "node patches/patch-core.mjs revert",
+    "check:compat": "node patches/check-harness-compat.mjs --pack 0.1.2-rc.1 --pack 0.1.5-rc.1 --pack 0.1.5-rc.2"
   },
   "keywords": [
     "dsh",

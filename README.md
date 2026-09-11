@@ -9,7 +9,12 @@ DSH 宿主插件：把工具结果（tool result）从对话上下文中清除�
 - **普通模式（round，默认）**：每轮结束后清除该轮全部工具结果，下一轮开始时不可见；
 - **overclock 模式**：同一轮内**逐步清除、滞后一步**——第 N 步的结果只对第 N+1 步的决策可见，第 N+1 步结束时即替换为占位符；每步结果归档为独立文件，模型需要更早步骤时用 `read_tool_result_log(turn, step)` 取回。
 
-> **兼容性**：同一份代码同时支持新旧两代 Harness 核心——新核心 ≥ **0.1.2-rc.1**（会话事件数组为 `session.log`）以及升级前的老核心（事件数组为 `session.events`，具体版本号未记录）。插件内部通过 `eventsOf()` 自动探测，无需按环境区分。overclock 的逐步清除依赖 `step/end` 事件；老核心没有步骤事件时自动退化为普通模式（每轮清除）。
+> **兼容性**：同一份代码同时支持三代 Harness 核心——
+> ① 老核心（会话事件数组为 `session.events`，无步骤事件，overclock 自动退化为普通模式）；
+> ② ≥ **0.1.2-rc.1**（事件数组改为 `session.log`）；
+> ③ ≥ **0.1.5-rc.1**（surface replace op 的键名由 `start`/`end` 改为 `startSeq`/`endSeq`，`dsh-agent-loop` 的系列判定拆成三处）。
+> 插件内部通过 `eventsOf()` 与核心代数探测自动适配，无需按环境区分或改配置；核心补丁也按代登记了各自的
+> 锚点变体。已实测代数：`0.1.2-rc.1`、`0.1.5-rc.1`、`0.1.5-rc.2`（`npm run check:compat`）。
 
 命令：`/clear-tool-results on|off|status|overclock`
 
@@ -108,6 +113,12 @@ turn/end：归档整轮，兜底清除最后一步结果
 
 ## 验证
 
+**核心代数兼容性**（补丁锚点、surface op 键名、应用/回退闭环）：
+
+```sh
+npm run check:compat   # 从 npm 拉取各代核心；也可 --tree <label>=<本地解包目录> 离线运行
+```
+
 **普通模式回归**：
 
 1. 第 1 轮：`请调用 bash 执行 echo TOPSECRET-12345，然后只回复"完成"`；
@@ -148,7 +159,8 @@ append 一个 `request/header {reason:"series"}`，Chat 界面就为每个系列
 
 - `dsh-session`：新增 `seriesGeneration`，只有「非清除型 replace」才递增；`replaceGeneration` 语义不变
   （模型上下文投影缓存、压缩轮询、客户端镜像都继续依赖它）。
-- `dsh-agent-loop`：系列判定改读 `seriesGeneration`（缺失时回退 `replaceGeneration`，可独立应用/回退）。
+- `dsh-agent-loop`：系列判定改读 `seriesGeneration`（缺失时回退 `replaceGeneration`，可独立应用/回退；
+  ≥ 0.1.5 的核心里该判定位于三处，补丁已按代登记变体）。
 
 补丁与命令绑定：`overclock` 自动应用、`on`/`off` 自动回退、`status` 显示状态。也可以手动执行：
 
@@ -163,7 +175,11 @@ npm run patch:revert   # 回退
 才会 append 一次 `request/header`，于是 Chat 每轮只展示一次（可折叠的）系统提示词。
 
 补丁写入的是磁盘上的核心文件，**必须重启 dsh GUI 进程**才会生效；核心升级/重装后重新
-`npm run patch:apply` 即可。原理与注意事项见 `patches/README.md`。
+`npm run patch:apply` 即可——跨代升级（如 0.1.2 → 0.1.5）时会自动挑对应代的锚点变体，
+装过旧版补丁的核心就地升级，`status` 会显示识别到的代数。原理与注意事项见 `patches/README.md`。
+
+插件运行时也按核心代数选择 surface op 键名（`start/end` ⇄ `startSeq/endSeq`），因此**即使没打补丁，
+逐步清除在老核心与新核心上都能正常工作**——只是每步会重开一个请求系列（系统提示词重复展示）。
 
 ## License
 

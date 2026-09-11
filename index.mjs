@@ -54,6 +54,8 @@ async function syncCorePatch(action) {
   try {
     const root = manager.resolveCoreRoot()
     if (!root) return '（未定位到 dsh 核心目录，可手动运行 npm run patch:apply -- --root <dsh 目录>）'
+  // 顺带校准 surface op 键名：>= 0.1.5 的核心要求 startSeq/endSeq
+  surfaceOpKeyNames = manager.surfaceOpKeys?.(root) ?? surfaceOpKeyNames
     if (action === 'apply') {
       const result = manager.applyPatches(root)
       return result.changed ? '；核心补丁已应用，重启 dsh GUI 后生效' : '；核心补丁已处于应用状态'
@@ -74,12 +76,14 @@ async function corePatchStatusLine() {
     if (!root) return '\n核心补丁：未知（未定位到 dsh 核心目录）'
     const status = manager.patchStatus(root)
     const label = status.applied
-      ? '已应用'
-      : status.files.every((file) => file.state === 'absent') ? '未应用' : '不完整'
+      ? (status.upgradable ? '已应用（有可升级位点）' : '已应用')
+      : status.functional
+        ? '已应用（旧补丁态，建议升级）'
+        : status.files.every((file) => file.state === 'absent') ? '未应用' : '不完整'
     const detail = status.files
       .map((file) => `${file.rel.includes('agent-loop') ? 'agent-loop' : 'session'}=${file.state}`)
       .join(' ')
-    const hint = status.applied ? '' : '；overclock 模式建议应用补丁（命令会自动处理）'
+    const hint = status.functional ? '' : '；overclock 模式建议应用补丁（命令会自动处理）'
     return `\n核心补丁：${label}（${detail}）${hint}`
   } catch (error) {
     return `\n核心补丁：检测失败（${String(error?.message ?? error)}）`
@@ -862,17 +866,34 @@ function toolNameOf(data, nameByCallId) {
     ?? UNKNOWN_TOOL
 }
 
-function replaceToolResult(session, seq, data, text, clearOnly = false) {
-  const surfaceOp = { op: 'replace', start: seq, end: seq }
-  // 仅当核心已打 seriesGeneration 补丁时才带 impact：旧核心的 isReplaceOp 只接受 3 个键
+/** 核心代数决定 surface op 的键名：<=0.1.4 用 start/end，>=0.1.5 用 startSeq/endSeq。 */
+const OP_KEYS_LEGACY = { start: 'start', end: 'end' }
+const OP_KEYS_SEQ = { start: 'startSeq', end: 'endSeq' }
+// 默认按当前主流代数（<=0.1.4）；首次写入若被核心拒绝会自动纠正并记住
+let surfaceOpKeyNames = OP_KEYS_LEGACY
+
+function buildSurfaceOp(keys, session, seq, clearOnly) {
+  const surfaceOp = { op: 'replace', [keys.start]: seq, [keys.end]: seq }
+  // 仅当核心已打 seriesGeneration 补丁时才带 impact：未打补丁的核心 isReplaceOp 只接受 3 个键
   if (clearOnly && supportsSeriesGeneration(session)) surfaceOp.impact = 'clear'
-  session.append(TOOL_RESULT, {
-    ...data,
-    message: clearedMessage(data.message, text),
-  }, {
-    surfaceOp,
-    sourceEventSeqs: [seq],
-  })
+  return surfaceOp
+}
+
+function replaceToolResult(session, seq, data, text, clearOnly = false) {
+  const payload = { ...data, message: clearedMessage(data.message, text) }
+  const write = (keys) =>
+    session.append(TOOL_RESULT, payload, {
+      surfaceOp: buildSurfaceOp(keys, session, seq, clearOnly),
+      sourceEventSeqs: [seq],
+    })
+  try {
+    write(surfaceOpKeyNames)
+  } catch (error) {
+    // 核心的 surfaceOp 校验先于写入，失败尝试不会污染会话日志；换另一代键名重试一次并记住
+    if (!/invalid replace surfaceOp/i.test(String(error?.message ?? error))) throw error
+    surfaceOpKeyNames = surfaceOpKeyNames === OP_KEYS_LEGACY ? OP_KEYS_SEQ : OP_KEYS_LEGACY
+    write(surfaceOpKeyNames)
+  }
 }
 
 /** 核心补丁（seriesGeneration 双代数）是否已在当前进程生效。 */

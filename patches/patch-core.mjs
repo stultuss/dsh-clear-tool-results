@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-clear-tool-results · 核心补丁管理器（方案 C）
+ * dsh-clear-tool-results · 核心补丁管理器（多代适配）
  *
  * 背景
  *   插件 overclock 模式每一步都会把上一步的工具结果替换为占位符（surface replace）。
@@ -17,8 +17,30 @@
  *   agent-loop 的系列判定改读 `seriesGeneration`（缺失时回退 `replaceGeneration`，
  *   所以两个文件可以独立应用/回退，任一侧未打补丁都保持原行为）。
  *
+ * 多代适配
+ *   核心有两条代码谱系，差异不只是版本号，所以按「位点变体」适配而不是解析版本号：
+ *
+ *   legacy（<= 0.1.4）
+ *     · surface op 键名：`start` / `end`
+ *     · agent-loop：局部量 `const surfaceGeneration = this.session.surface.replaceGeneration`
+ *       同时供比较与重捕获使用 → 单点补丁即可覆盖全部系列判定
+ *
+ *   seq（>= 0.1.5）
+ *     · surface op 键名：`startSeq` / `endSeq`（isReplaceOp 同时用 Object.hasOwn + isEventSeq 校验）
+ *     · agent-loop：拆成「构造期捕获 + 系统提示投影比较 + buildRequest 局部量」三处，
+ *       并新增 `startsRequestSeries` / `toolsChanged(...)` 两个输入 → 一个变体含 3 组替换
+ *
+ *   每个位点可挂多个变体，apply 时挑选当前文件里恰好匹配的那一个；任一位点无变体匹配
+ *   → 整体拒绝写入（先全量校验、后落盘），绝不产生半补丁状态。
+ *
+ *   跨代拼写兼容：isReplaceOp 同时接受两种键拼写并就地归一化到本代规范拼写，
+ *   因此旧核心写入的历史会话日志也能在新核心上折叠重放（反向亦然）。
+ *
+ *   历史补丁态：v1 补丁写出的文本也登记在 `from` 列表里，所以已经装过 v1 的核心
+ *   可以就地升级到 v2，revert 仍能回到原始文件。
+ *
  * 用法
- *   node patches/patch-core.mjs status            # 查看补丁状态
+ *   node patches/patch-core.mjs status            # 查看补丁状态（含核心代数）
  *   node patches/patch-core.mjs apply             # 应用（备份到 ~/.dsh/clear-tool-results-backups/）
  *   node patches/patch-core.mjs revert            # 回退
  *   node patches/patch-core.mjs apply --root /path/to/@deepseek-ai/dsh
@@ -26,8 +48,7 @@
  *
  * 注意
  *   补丁写入的是磁盘上的核心包文件，**必须重启 dsh GUI 进程**才会加载新代码。
- *   /clear-tool-results 命令已与补丁绑定：overclock → 自动 apply；on/off → 自动 revert；
- *   status 显示补丁状态。
+ *   /clear-tool-results 命令已与补丁绑定：overclock → 自动 apply；on/off → 自动 revert。
  */
 import { spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -36,54 +57,203 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const BACKUP_DIR = join(homedir(), '.dsh', 'clear-tool-results-backups')
+// 备份目录可覆盖：CI / 兼容性验证脚本会指向临时目录
+const BACKUP_DIR = process.env.DSH_CLEAR_TOOL_RESULTS_BACKUP_DIR ?? join(homedir(), '.dsh', 'clear-tool-results-backups')
 
-const SESSION_REL = 'node_modules/@deepseek-ai/dsh-session/lib/index.js'
-const AGENT_LOOP_REL = 'node_modules/@deepseek-ai/dsh-agent-loop/lib/index.js'
+export const SESSION_REL = 'node_modules/@deepseek-ai/dsh-session/lib/index.js'
+export const AGENT_LOOP_REL = 'node_modules/@deepseek-ai/dsh-agent-loop/lib/index.js'
 
-/** 各补丁位点：old 必须逐字出现且唯一；new 为替换后的文本。 */
+/** 核心代数标识。 */
+export const GEN_LEGACY = 'legacy' // <= 0.1.4
+export const GEN_SEQ = 'seq' // >= 0.1.5
+
+const KEY_NAMES = {
+  [GEN_LEGACY]: { start: 'start', end: 'end' },
+  [GEN_SEQ]: { start: 'startSeq', end: 'endSeq' },
+}
+
+/** 判定核心代数的稳定特征（打补丁前后都成立）。 */
+const SEQ_MARKER = 'isEventSeq(op["startSeq"])'
+
+/** v1 补丁写出的 isReplaceOp 文本（用于就地升级）。 */
+const V1_REPLACE_OP_SHAPE =
+  '\tconst keys = Object.keys(op);\n' +
+  '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);'
+
+/**
+ * 各补丁位点。
+ *   variants: [{ gens, pairs: [{ from: [...可接受的现状文本], to: 补丁后文本 }] }]
+ *   · from[0] 必为原始（未打补丁）文本，revert 会回到它；
+ *   · from[1..] 为历史补丁态，apply 时可就地升级；
+ *   · to 必须唯一出现；一个变体可含多组替换（同代里同一语义散落在多处）。
+ */
 const EDITS = [
   {
     file: SESSION_REL,
     id: 'session:fold-state',
     note: 'fold 状态新增 seriesGeneration（系列代数，初始 0）',
-    old: 'function createFoldState() {\n\treturn {\n\t\tnodes: [],\n\t\treplaceGeneration: 0\n\t};\n}',
-    new: 'function createFoldState() {\n\treturn {\n\t\tnodes: [],\n\t\treplaceGeneration: 0,\n\t\tseriesGeneration: 0\n\t};\n}',
+    variants: [
+      {
+        gens: [GEN_LEGACY, GEN_SEQ],
+        pairs: [
+          {
+            from: [
+              'function createFoldState() {\n\treturn {\n\t\tnodes: [],\n\t\treplaceGeneration: 0\n\t};\n}',
+            ],
+            to: 'function createFoldState() {\n\treturn {\n\t\tnodes: [],\n\t\treplaceGeneration: 0,\n\t\tseriesGeneration: 0\n\t};\n}',
+          },
+        ],
+      },
+    ],
   },
   {
     file: SESSION_REL,
     id: 'session:replace-op-shape',
-    note: 'isReplaceOp 放行第 4 个键 impact:"clear"',
-    old: '\treturn Object.keys(op).length === 3 && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);',
-    new: '\tconst keys = Object.keys(op);\n\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);',
+    note: 'isReplaceOp 放行第 4 个键 impact:"clear"，并兼容另一代的键拼写',
+    variants: [
+      {
+        gens: [GEN_LEGACY],
+        pairs: [
+          {
+            from: [
+              '\treturn Object.keys(op).length === 3 && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);',
+              V1_REPLACE_OP_SHAPE,
+            ],
+            to:
+              '\tif (op === null || typeof op !== "object") return false;\n' +
+              '\tconst keys = Object.keys(op);\n' +
+              '\t// 跨代兼容：新核心写入的日志用 startSeq/endSeq，就地归一化为本代拼写\n' +
+              '\tif (Object.hasOwn(op, "startSeq") && !Object.hasOwn(op, "start")) {\n' +
+              '\t\top["start"] = op["startSeq"];\n' +
+              '\t\top["end"] = op["endSeq"];\n' +
+              '\t\tdelete op["startSeq"];\n' +
+              '\t\tdelete op["endSeq"];\n' +
+              '\t}\n' +
+              '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);',
+          },
+        ],
+      },
+      {
+        gens: [GEN_SEQ],
+        pairs: [
+          {
+            from: [
+              '\treturn Object.keys(op).length === 3 && Object.hasOwn(op, "op") && Object.hasOwn(op, "startSeq") && Object.hasOwn(op, "endSeq") && op["op"] === "replace" && isEventSeq(op["startSeq"]) && isEventSeq(op["endSeq"]);',
+            ],
+            to:
+              '\tif (op === null || typeof op !== "object") return false;\n' +
+              '\tconst keys = Object.keys(op);\n' +
+              '\t// 跨代兼容：旧核心写入的日志用 start/end，就地归一化为本代拼写\n' +
+              '\tif (Object.hasOwn(op, "start") && !Object.hasOwn(op, "startSeq")) {\n' +
+              '\t\top["startSeq"] = op["start"];\n' +
+              '\t\top["endSeq"] = op["end"];\n' +
+              '\t\tdelete op["start"];\n' +
+              '\t\tdelete op["end"];\n' +
+              '\t}\n' +
+              '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && op["op"] === "replace" && isEventSeq(op["startSeq"]) && isEventSeq(op["endSeq"]);',
+          },
+        ],
+      },
+    ],
   },
   {
     file: SESSION_REL,
     id: 'session:plan-passthrough',
     note: 'planSurfaceEvent 把 impact 透传进 plan',
-    old: '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\t...range\n\t};',
-    new: '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\timpact: surfaceOp.impact,\n\t\t...range\n\t};',
+    variants: [
+      {
+        gens: [GEN_LEGACY],
+        pairs: [
+          {
+            from: [
+              '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\t...range\n\t};',
+            ],
+            to: '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\timpact: surfaceOp.impact,\n\t\t...range\n\t};',
+          },
+        ],
+      },
+      {
+        gens: [GEN_SEQ],
+        pairs: [
+          {
+            from: ['start: surfaceOp.startSeq,'],
+            to: 'start: surfaceOp.startSeq,\n\t\timpact: surfaceOp.impact,',
+          },
+        ],
+      },
+    ],
   },
   {
     file: SESSION_REL,
     id: 'session:series-counter',
     note: '清除型 replace 不递增 seriesGeneration（replaceGeneration 照旧 +1）',
-    old: '\telse if (plan?.kind === "replace") {\n\t\tstate.nodes.splice(plan.startIdx, plan.endIdx - plan.startIdx + 1, plan.seq);\n\t\tstate.replaceGeneration += 1;\n\t}',
-    new: '\telse if (plan?.kind === "replace") {\n\t\tstate.nodes.splice(plan.startIdx, plan.endIdx - plan.startIdx + 1, plan.seq);\n\t\tstate.replaceGeneration += 1;\n\t\tif (plan.impact !== "clear") state.seriesGeneration += 1;\n\t}',
+    variants: [
+      {
+        gens: [GEN_LEGACY, GEN_SEQ],
+        pairs: [
+          {
+            from: [
+              '\telse if (plan?.kind === "replace") {\n\t\tstate.nodes.splice(plan.startIdx, plan.endIdx - plan.startIdx + 1, plan.seq);\n\t\tstate.replaceGeneration += 1;\n\t}',
+            ],
+            to: '\telse if (plan?.kind === "replace") {\n\t\tstate.nodes.splice(plan.startIdx, plan.endIdx - plan.startIdx + 1, plan.seq);\n\t\tstate.replaceGeneration += 1;\n\t\tif (plan.impact !== "clear") state.seriesGeneration += 1;\n\t}',
+          },
+        ],
+      },
+    ],
   },
   {
     file: SESSION_REL,
     id: 'session:series-getter',
     note: 'surface 暴露 seriesGeneration getter',
-    old: '\t/** Monotonic count of folded positional replacements. */\n\tget replaceGeneration() {\n\t\tif (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta();\n\t\treturn this._state.replaceGeneration;\n\t}',
-    new: '\t/** Monotonic count of folded positional replacements. */\n\tget replaceGeneration() {\n\t\tif (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta();\n\t\treturn this._state.replaceGeneration;\n\t}\n\t/** Monotonic count of folded positional replacements that are not clear-only. */\n\tget seriesGeneration() {\n\t\tif (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta();\n\t\treturn this._state.seriesGeneration;\n\t}',
+    variants: [
+      {
+        gens: [GEN_LEGACY, GEN_SEQ],
+        pairs: [
+          {
+            from: [
+              '\t/** Monotonic count of folded positional replacements. */\n\tget replaceGeneration() {\n\t\tif (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta();\n\t\treturn this._state.replaceGeneration;\n\t}',
+            ],
+            to: '\t/** Monotonic count of folded positional replacements. */\n\tget replaceGeneration() {\n\t\tif (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta();\n\t\treturn this._state.replaceGeneration;\n\t}\n\t/** Monotonic count of folded positional replacements that are not clear-only. */\n\tget seriesGeneration() {\n\t\tif (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta();\n\t\treturn this._state.seriesGeneration;\n\t}',
+          },
+        ],
+      },
+    ],
   },
   {
     file: AGENT_LOOP_REL,
     id: 'agent-loop:series-generation',
     note: '系列判定改读 seriesGeneration（缺失时回退 replaceGeneration）',
-    old: 'const surfaceGeneration = this.session.surface.replaceGeneration;',
-    new: 'const surfaceGeneration = this.session.surface.seriesGeneration ?? this.session.surface.replaceGeneration;',
+    variants: [
+      {
+        gens: [GEN_LEGACY],
+        pairs: [
+          {
+            from: ['const surfaceGeneration = this.session.surface.replaceGeneration;'],
+            to: 'const surfaceGeneration = this.session.surface.seriesGeneration ?? this.session.surface.replaceGeneration;',
+          },
+        ],
+      },
+      {
+        gens: [GEN_SEQ],
+        pairs: [
+          {
+            // 构造期捕获
+            from: ['this.requestSurfaceGeneration = session.surface.replaceGeneration;'],
+            to: 'this.requestSurfaceGeneration = session.surface.seriesGeneration ?? session.surface.replaceGeneration;',
+          },
+          {
+            // 系统提示投影处的比较
+            from: ['this.requestSurfaceGeneration !== this.session.surface.replaceGeneration'],
+            to: 'this.requestSurfaceGeneration !== (this.session.surface.seriesGeneration ?? this.session.surface.replaceGeneration)',
+          },
+          {
+            // buildRequest 内的局部量（同时供比较与重新捕获）
+            from: ['const surfaceGeneration = session.surface.replaceGeneration;'],
+            to: 'const surfaceGeneration = session.surface.seriesGeneration ?? session.surface.replaceGeneration;',
+          },
+        ],
+      },
+    ],
   },
 ]
 
@@ -114,6 +284,10 @@ function backupPath(root, rel) {
   return join(BACKUP_DIR, `${rel.replace(/[\\/]/g, '_')}.${tag}.orig`)
 }
 
+function backupMetaPath(root, rel) {
+  return `${backupPath(root, rel)}.json`
+}
+
 function countOccurrences(haystack, needle) {
   if (!needle) return 0
   let count = 0
@@ -125,6 +299,65 @@ function countOccurrences(haystack, needle) {
   return count
 }
 
+/**
+ * 由源码判定核心代数。用 isReplaceOp 的校验表达式做特征：
+ * 打补丁前后、两种补丁态下都稳定，不受跨代兼容代码影响。
+ */
+export function generationOfSource(source) {
+  return source.includes(SEQ_MARKER) ? GEN_SEQ : GEN_LEGACY
+}
+
+/** 当前核心所属代数；定位失败返回 null。 */
+export function coreGeneration(root = resolveCoreRoot()) {
+  if (!root) return null
+  try {
+    return generationOfSource(readFileSync(targetPath(root, SESSION_REL), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/** 当前核心的 surface op 键名（插件运行时按此构造 replace op）。 */
+export function surfaceOpKeys(root = resolveCoreRoot()) {
+  return KEY_NAMES[coreGeneration(root) ?? GEN_LEGACY]
+}
+
+function variantState(source, variant) {
+  if (variant.pairs.every((pair) => countOccurrences(source, pair.to) === 1)) return 'applied'
+  const noTarget = variant.pairs.every((pair) => countOccurrences(source, pair.to) === 0)
+  const eachSource = variant.pairs.every((pair) =>
+    pair.from.some((candidate) => countOccurrences(source, candidate) === 1),
+  )
+  if (noTarget && eachSource) return 'absent'
+  return 'drift'
+}
+
+/** 变体当前处于哪种来源态：原始（0）还是某个历史补丁态（>0）。 */
+function matchedSourceIndex(source, variant) {
+  const indexes = variant.pairs.map((pair) =>
+    pair.from.findIndex((candidate) => countOccurrences(source, candidate) === 1),
+  )
+  if (indexes.some((index) => index < 0)) return -1
+  return Math.max(...indexes)
+}
+
+function pickEditState(source, edit) {
+  const evaluated = edit.variants.map((variant) => ({ variant, state: variantState(source, variant) }))
+  const applied = evaluated.find((item) => item.state === 'applied')
+  const absent = evaluated.find((item) => item.state === 'absent')
+  const chosen = applied ?? absent ?? evaluated[0]
+  return {
+    id: edit.id,
+    note: edit.note,
+    state: chosen.state,
+    gen: chosen.variant.gens.join('/'),
+    upgrade: chosen.state === 'absent' ? matchedSourceIndex(source, chosen.variant) > 0 : false,
+    oldCount: countOccurrences(source, chosen.variant.pairs[0].from[0]),
+    newCount: countOccurrences(source, chosen.variant.pairs[0].to),
+    variants: evaluated.map((item) => ({ gen: item.variant.gens.join('/'), state: item.state })),
+  }
+}
+
 /** 每个文件的补丁状态：applied / absent / partial / drift。 */
 export function patchStatus(root = resolveCoreRoot()) {
   if (!root) throw new Error('未定位到 dsh 核心目录，请用 --root 指定（含 node_modules/@deepseek-ai/dsh-session 的目录）')
@@ -132,21 +365,22 @@ export function patchStatus(root = resolveCoreRoot()) {
   for (const rel of [SESSION_REL, AGENT_LOOP_REL]) {
     const path = targetPath(root, rel)
     const source = readFileSync(path, 'utf8')
-    const edits = EDITS.filter((edit) => edit.file === rel).map((edit) => {
-      const oldCount = countOccurrences(source, edit.old)
-      const newCount = countOccurrences(source, edit.new)
-      // 追加式补丁的 new 文本包含 old，因此以 new 的出现次数为准
-      let state = 'drift'
-      if (newCount === 1) state = 'applied'
-      else if (oldCount === 1 && newCount === 0) state = 'absent'
-      return { id: edit.id, note: edit.note, state, oldCount, newCount }
-    })
+    const edits = EDITS.filter((edit) => edit.file === rel).map((edit) => pickEditState(source, edit))
     const states = new Set(edits.map((edit) => edit.state))
-    let state = 'partial'
-    if (states.size === 1) state = [...states][0]
+    const state = states.size === 1 ? [...states][0] : 'partial'
     files.push({ rel, path, state, edits })
   }
-  return { root, files, applied: files.every((file) => file.state === 'applied') }
+  const generation = generationOfSource(readFileSync(targetPath(root, SESSION_REL), 'utf8'))
+  const edits = files.flatMap((file) => file.edits)
+  return {
+    root,
+    files,
+    generation,
+    applied: files.every((file) => file.state === 'applied'),
+    // 补丁功能是否已生效：位点处于「已应用」或「历史补丁态」都算生效
+    functional: edits.every((edit) => edit.state === 'applied' || (edit.state === 'absent' && edit.upgrade)),
+    upgradable: edits.some((edit) => edit.upgrade),
+  }
 }
 
 function syntaxCheck(path) {
@@ -160,36 +394,63 @@ function syntaxCheck(path) {
   return { ok: false, message }
 }
 
-/** 应用补丁；返回 { changed, skipped, files }。 */
+/** 应用补丁；返回 { changed, files, upgraded }。任一位点失配则整体拒绝。 */
 export function applyPatches(root = resolveCoreRoot()) {
   if (!root) throw new Error('未定位到 dsh 核心目录，请用 --root 指定（含 node_modules/@deepseek-ai/dsh-session 的目录）')
+  const generation = coreGeneration(root)
   const plan = []
   for (const rel of [SESSION_REL, AGENT_LOOP_REL]) {
     const path = targetPath(root, rel)
     const original = readFileSync(path, 'utf8')
     let next = original
     let changed = false
+    let upgraded = false
     for (const edit of EDITS.filter((item) => item.file === rel)) {
-      if (countOccurrences(next, edit.new) === 1) continue // 已应用（追加式补丁的 new 含 old）
-      const oldCount = countOccurrences(next, edit.old)
-      if (oldCount !== 1) {
+      const state = pickEditState(next, edit)
+      if (state.state === 'applied') continue
+      if (state.state === 'drift') {
+        const detail = state.variants.map((item) => `${item.gen}:${item.state}`).join(', ')
         throw new Error(
-          `补丁位点不匹配（${edit.id}）：在 ${rel} 中找到 ${oldCount} 处目标文本，` +
-          '说明核心版本已变化。请勿强行应用，先联系插件作者更新补丁定义。',
+          `补丁位点不匹配（${edit.id}）：没有变体能在 ${rel} 中唯一匹配（${detail}）。` +
+            '说明该核心版本的实现已变化（可能是新的核心代数）。请勿强行应用，先更新补丁定义。',
         )
       }
-      next = next.replace(edit.old, edit.new)
+      const variant = edit.variants.find((item) => variantState(next, item) === 'absent')
+      if (!variant) throw new Error(`补丁位点无可应用变体（${edit.id}）。`)
+      if (matchedSourceIndex(next, variant) > 0) upgraded = true
+      for (const pair of variant.pairs) {
+        const source = pair.from.find((candidate) => countOccurrences(next, candidate) === 1)
+        if (!source) {
+          throw new Error(`补丁位点不唯一（${edit.id}）：在 ${rel} 中找不到唯一的现状文本。`)
+        }
+        next = next.replace(source, pair.to)
+      }
       changed = true
     }
-    plan.push({ rel, path, original, next, changed })
+    plan.push({ rel, path, original, next, changed, upgraded })
   }
   const changedFiles = plan.filter((item) => item.changed)
-  if (changedFiles.length === 0) return { changed: false, files: plan.map((item) => item.rel) }
+  if (changedFiles.length === 0) {
+    return { changed: false, generation, files: plan.map((item) => item.rel), upgraded: false }
+  }
 
   mkdirSync(BACKUP_DIR, { recursive: true })
   for (const item of changedFiles) {
     const backup = backupPath(root, item.rel)
-    if (!existsSync(backup)) copyFileSync(item.path, backup)
+    const meta = backupMetaPath(root, item.rel)
+    // 备份必须与当前核心同代：升级/降级核心后，异代备份不可用于还原
+    let reuse = false
+    if (existsSync(backup) && existsSync(meta)) {
+      try {
+        reuse = JSON.parse(readFileSync(meta, 'utf8')).generation === generation
+      } catch {
+        reuse = false
+      }
+    }
+    if (!reuse) {
+      copyFileSync(item.path, backup)
+      writeFileSync(meta, JSON.stringify({ generation, createdAt: new Date().toISOString() }, null, 2))
+    }
     writeFileSync(item.path, item.next)
     const check = syntaxCheck(item.path)
     if (!check.ok) {
@@ -197,49 +458,98 @@ export function applyPatches(root = resolveCoreRoot()) {
       throw new Error(`补丁写入后语法校验失败，已回滚 ${item.rel}：${check.message}`)
     }
   }
-  return { changed: true, files: changedFiles.map((item) => item.rel) }
+  return {
+    changed: true,
+    generation,
+    files: changedFiles.map((item) => item.rel),
+    upgraded: changedFiles.some((item) => item.upgraded),
+  }
 }
 
-/** 回退补丁：优先从备份恢复，否则反向替换。 */
+/**
+ * 备份是否真的能当当前文件的"前身"用：
+ * 除了代数一致，还要求备份含有各位点的原始文本、且当前文件确实是这些位点的补丁态。
+ * 这样即使同代数内跨了小版本（锚点文本已变），也不会把异版原文写回去。
+ */
+function backupMatchesSites(rel, backupText, currentText) {
+  return EDITS.filter((edit) => edit.file === rel).every((edit) =>
+    edit.variants.some((variant) =>
+      variant.pairs.every(
+        (pair) =>
+          pair.from.some((candidate) => backupText.includes(candidate)) && currentText.includes(pair.to),
+      ),
+    ),
+  )
+}
+
+/** 回退补丁：优先从同代备份恢复，否则反向替换。 */
 export function revertPatches(root = resolveCoreRoot()) {
   if (!root) throw new Error('未定位到 dsh 核心目录，请用 --root 指定（含 node_modules/@deepseek-ai/dsh-session 的目录）')
+  const generation = coreGeneration(root)
   let changed = false
   const files = []
+  const skippedBackups = []
   for (const rel of [SESSION_REL, AGENT_LOOP_REL]) {
     const path = targetPath(root, rel)
     const backup = backupPath(root, rel)
+    const meta = backupMetaPath(root, rel)
+    const source = readFileSync(path, 'utf8')
     if (existsSync(backup)) {
-      const current = readFileSync(path, 'utf8')
-      const original = readFileSync(backup, 'utf8')
-      if (current !== original) {
-        writeFileSync(path, original)
-        changed = true
+      let compatible = generationOfSource(readFileSync(backup, 'utf8')) === generation
+      if (existsSync(meta)) {
+        try {
+          compatible = JSON.parse(readFileSync(meta, 'utf8')).generation === generation
+        } catch {
+          /* 元数据损坏时退回内容判定 */
+        }
       }
-      files.push(rel)
-      continue
+      if (compatible && backupMatchesSites(rel, readFileSync(backup, 'utf8'), source)) {
+        const original = readFileSync(backup, 'utf8')
+        if (source !== original) {
+          writeFileSync(path, original)
+          changed = true
+        }
+        files.push(rel)
+        continue
+      }
+      // 备份属于另一代核心（升级/降级过），不可还原 —— 走反向替换
+      skippedBackups.push(rel)
     }
-    let source = readFileSync(path, 'utf8')
+    let next = source
     let touched = false
     for (const edit of EDITS.filter((item) => item.file === rel)) {
-      if (countOccurrences(source, edit.new) === 1) {
-        source = source.replace(edit.new, edit.old)
-        touched = true
+      if (pickEditState(next, edit).state !== 'applied') continue
+      const variant = edit.variants.find((item) => variantState(next, item) === 'applied')
+      for (const pair of variant.pairs) {
+        if (countOccurrences(next, pair.to) !== 1) continue
+        next = next.replace(pair.to, pair.from[0])
       }
+      touched = true
     }
     if (touched) {
-      writeFileSync(path, source)
+      writeFileSync(path, next)
       changed = true
       files.push(rel)
     }
   }
-  return { changed, files }
+  return { changed, generation, files, skippedBackups }
 }
 
 function formatStatus(status) {
-  const lines = [`dsh 核心目录：${status.root}`, `整体状态：${status.applied ? '已应用' : '未应用/不完整'}`, '']
+  const label = status.generation === GEN_SEQ ? 'seq（>= 0.1.5：surface op 用 startSeq/endSeq）' : 'legacy（<= 0.1.4：surface op 用 start/end）'
+  const lines = [
+    `dsh 核心目录：${status.root}`,
+    `核心代数：${label}`,
+    `整体状态：${status.applied ? (status.upgradable ? '已应用（有可升级位点）' : '已应用') : status.functional ? '已应用（旧补丁态，建议升级）' : '未应用/不完整'}`,
+    '',
+  ]
   for (const file of status.files) {
     lines.push(`· ${file.rel} → ${file.state}`)
-    for (const edit of file.edits) lines.push(`    - [${edit.state}] ${edit.id}：${edit.note}`)
+    for (const edit of file.edits) {
+      const variants = edit.variants.map((item) => `${item.gen}=${item.state}`).join(' ')
+      const upgrade = edit.upgrade ? '（可从旧补丁态升级）' : ''
+      lines.push(`    - [${edit.state}]${upgrade} ${edit.id}：${edit.note}  {${variants}}`)
+    }
   }
   lines.push('', '提示：补丁写入磁盘后需重启 dsh GUI 进程才会加载。')
   return lines.join('\n')
@@ -265,16 +575,34 @@ function main(argv) {
     }
     if (command === 'apply') {
       const result = applyPatches(root)
-      console.log(asJson ? JSON.stringify(result, null, 2) : result.changed
-        ? `已应用核心补丁：\n${result.files.map((file) => `  · ${file}`).join('\n')}\n请重启 dsh GUI 后生效。`
-        : '核心补丁已处于应用状态，无需操作。')
+      if (asJson) {
+        console.log(JSON.stringify(result, null, 2))
+        return
+      }
+      if (!result.changed) {
+        console.log('核心补丁已处于应用状态，无需操作。')
+        return
+      }
+      const upgraded = result.upgraded ? '\n（检测到旧版补丁，已就地升级到当前补丁定义。）' : ''
+      console.log(
+        `已应用核心补丁（${result.generation}）：\n${result.files.map((file) => `  · ${file}`).join('\n')}${upgraded}\n请重启 dsh GUI 后生效。`,
+      )
       return
     }
     if (command === 'revert') {
       const result = revertPatches(root)
-      console.log(asJson ? JSON.stringify(result, null, 2) : result.changed
-        ? `已回退核心补丁：\n${result.files.map((file) => `  · ${file}`).join('\n')}\n请重启 dsh GUI 后生效。`
-        : '核心补丁未应用，无需回退。')
+      const skipped = result.skippedBackups?.length
+        ? `\n注意：${result.skippedBackups.join('、')} 的备份属于另一代核心，已改用反向替换，未使用备份。`
+        : ''
+      if (asJson) {
+        console.log(JSON.stringify(result, null, 2))
+        return
+      }
+      console.log(
+        result.changed
+          ? `已回退核心补丁：\n${result.files.map((file) => `  · ${file}`).join('\n')}\n请重启 dsh GUI 后生效。${skipped}`
+          : `核心补丁未应用，无需回退。${skipped}`,
+      )
       return
     }
     console.error(`未知命令：${command}（可用：status / apply / revert）`)
