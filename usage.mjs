@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 // 归因埋点（0.6.3 新增）：被清除的工具结果，后来究竟从哪条路被"再用"。
@@ -171,19 +171,33 @@ export function takeHint(sessionId) {
   }
 }
 
-/** 占位符里的一行索引：让模型不必先取回就知道这一步里有什么。 */
+function shortText(value, limit) {
+  const text = String(value == null ? '' : value)
+  return text.length > limit ? text.slice(0, Math.max(1, limit - 1)) + '…' : text
+}
+
+/** 占位符里的一行索引：让模型不必先取回就知道这一步里有什么；整行压到 60 字以内。 */
 export function indexText(items) {
   try {
     const list = (items || []).filter(Boolean)
     if (list.length === 0) return ''
-    const parts = []
-    for (const item of list.slice(0, 2)) {
-      const chars = item.chars || 0
-      const size = chars >= 1000 ? (chars / 1000).toFixed(1) + 'k 字符' : chars + ' 字符'
-      parts.push(item.tool + ' → ' + (item.hint || '（无参数）') + '（' + size + (item.failed ? '，失败' : '') + '）')
+    const build = (hintLimit) => {
+      const parts = []
+      for (const item of list.slice(0, 2)) {
+        const name = shortText(item.tool, 12)
+        const hint = item.hint ? shortText(item.hint, hintLimit) : '无参数'
+        const chars = item.chars || 0
+        const size = chars > 0 ? (chars >= 1000 ? (chars / 1000).toFixed(1) + 'k' : String(chars)) : ''
+        const tail = [size, item.failed ? '失败' : ''].filter(Boolean).join('，')
+        parts.push(name + ' → ' + hint + (tail ? '（' + tail + '）' : ''))
+      }
+      if (list.length > 2) parts.push('等 ' + list.length + ' 条')
+      return parts.join(' + ')
     }
-    if (list.length > 2) parts.push('等 ' + list.length + ' 条')
-    return parts.join(' + ')
+    let text = build(26)
+    if (text.length > 60) text = build(12)
+    if (text.length > 60) text = text.slice(0, 59) + '…'
+    return text
   } catch {
     return ''
   }
@@ -215,11 +229,11 @@ export function summaryText(sessionId) {
   }
 }
 
-/** 写 <logsDir>/usage.json（每轮末一次，失败不影响主流程）。 */
+/** 写 <logsDir>/usage.json（每轮末一次）。不做兜底：写失败要让调用方看见并记录。 */
 export async function persist(sessionId, logsDir) {
-  try {
+  {
     const book = books.get(sessionId)
-    if (!book || (book.stats.cleared || 0) === 0) return
+    if (!book || (book.stats.cleared || 0) === 0) return null
     const payload = {
       schemaVersion: 1,
       sessionId,
@@ -234,8 +248,9 @@ export async function persist(sessionId, logsDir) {
         channelAt: entry.hitAt || null,
       })),
     }
-    await writeFile(join(logsDir, USAGE_FILE), JSON.stringify(payload, null, 2), 'utf8')
-  } catch {
-    // 忽略
+    const file = join(logsDir, USAGE_FILE)
+    await mkdir(logsDir, { recursive: true })
+    await writeFile(file, JSON.stringify(payload, null, 2), 'utf8')
+    return file
   }
 }

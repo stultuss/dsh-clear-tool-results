@@ -253,8 +253,12 @@ async function onTurnEnd(ctx, session, endedTurn) {
       if (typeof endedTurn === 'number') await archiveUnarchived(session, endedTurn - 1, logsDir)
       // 刷新刚结束的轮次，保证归档完整
       if (typeof endedTurn === 'number') await archiveTurn(session, endedTurn, logsDir, true)
-      // 归因埋点落盘（0.6.3）：本轮被清除的结果后来从哪条路被"再用"
-      await usage.persist(session.id, logsDir)
+      // 归因埋点落盘（0.6.4）：本轮被清除的结果后来从哪条路被"再用"；写失败要可见
+      try {
+        await usage.persist(session.id, logsDir)
+      } catch (error) {
+        warn(ctx, '归因埋点落盘失败：' + String(error))
+      }
     })
   } catch (error) {
     // 归档失败不能连带跳过清除：否则工具结果会一直留在上下文里（0.1.5 上曾整轮不生效）
@@ -570,6 +574,17 @@ function resultFailed(data) {
   return /(^|\n)\s*(exit code|退出码)\s*[:：]?\s*[1-9]/.test(text)
 }
 
+/** 同一步里的 PTC 子调用（run_code 内部的 bash/read/…）：索引行优先用它们。 */
+function ptcItemsOf(events, turn, step) {
+  const items = []
+  for (const event of events) {
+    if (event?.type !== 'tool/ptc-dispatch') continue
+    if (event.data?.turn !== turn || event.data?.step !== step) continue
+    items.push({ tool: event.data?.name ?? 'tool', hint: callHintOf({ arguments: event.data?.arguments }), chars: 0, failed: false })
+  }
+  return items
+}
+
 /** 一条被清除结果的索引信息：同一步的多条结果合并成一行，供占位符使用。 */
 function describeClearedResult(session, data) {
   try {
@@ -589,11 +604,18 @@ function describeClearedResult(session, data) {
         failed: resultFailed(event.data),
       })
     }
+    // PTC 模式下真正干活的是 run_code 里的子调用：索引行优先显示它们，
+    // 否则只会显示 run_code 的代码前缀（截断后是一段看不懂的碎片）
+    const dispatches = ptcItemsOf(events, data?.turn, data?.step)
+    if (dispatches.length > 0 && siblings.length > 0) {
+      dispatches[0].chars = siblings[0].chars
+      dispatches[0].failed = siblings[0].failed
+    }
     return {
       tool,
       text: resultTextOf(data?.message),
       callKey: usage.callKeyOf(tool, usage.argsText(call?.arguments)),
-      index: usage.indexText(siblings),
+      index: usage.indexText(dispatches.length > 0 ? dispatches : siblings),
     }
   } catch {
     return { tool: 'tool', text: '', callKey: null, index: '' }

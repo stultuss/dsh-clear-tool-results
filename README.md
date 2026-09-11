@@ -54,7 +54,7 @@ dsh plugin --profile web add dsh-clear-tool-results
 
 - **归档**：从追加式会话日志（而非改写后的 surface）取出原始 `tool/result`，保留轮次/步骤号、工具名与匹配的 `tool/call`。round 每轮写 `round-NNNN.json`，overclock 每个 `step/end` 写 `round-NNNN-step-MMM.json`，两者都登记进 `index.json`；以 index 为准、幂等，可补归档中途启用或重启前的轮次。
 - **清除**：round 在 `turn/end` 写入 `[第 3 轮工具结果已清除归档：bash → git status（1.2k 字符），可用 read_tool_result_log(turn: 3) 读取]`；overclock 在 `step/end` 清除上一步并在占位符注明步骤，`turn/end` 兜底清除最后一步。
-- **占位符索引**：占位符带一步索引——工具名 → 关键参数（命令/路径/模式，前 40 字）+ 规模 + 是否失败；同一步多条合并成一行。让模型先知道「里面有什么」，再决定要不要取回。
+- **占位符索引**：占位符带一步索引——工具名 → 关键参数（命令/路径/模式）+ 规模 + 是否失败，整行压到 60 字以内；同一步多条合并成一行；PTC（`run_code`）下优先显示里面的子调用（`bash → git status`），而不是 run_code 的代码前缀。让模型先知道「里面有什么」，再决定要不要取回。
 - **取回引导**：overclock 下每轮第一条清除占位符附带「可见性规则」（取回内容同样只存活一步，需精确原文时在使用的上一步再取），其余占位符保持短文本；`read_tool_result_log` 成功返回时附 `note` 提示。
 - **归因埋点**：`usage.mjs` 只观测不改行为——每条被清除结果的「可辨识记号」（含数字/路径）此后首次出现在哪里，就归入 `read` / `rerun` / `carryText` / `carryReasoning` / `reuseArgs` 之一，每轮末写 `<logsDir>/usage.json`，`status` 显示一行汇总。用来判断「引导取回」值不值得做。
 - **开关与状态**：`{ enabled, mode }` 存于 `$DSH_HOME/clear-tool-results.json`（默认启用 + round；旧状态文件按 round 兼容）。
