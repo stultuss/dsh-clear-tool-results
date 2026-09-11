@@ -2,7 +2,7 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。此处只记录版本之间的行为差异。
 
-## [未发布]
+## [0.6.8] - 2026-09-12
 
 ### Fixed
 - `read_tool_result_log` 的字符串编号在 0.6.7 上**没有生效**：实测 `turn: "13"`
