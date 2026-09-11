@@ -2,6 +2,20 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。
 
+## [未发布]
+
+### 修复
+
+- **`patch:apply` 在 dsh profile / pnpm 全局安装下报“未定位到 dsh 核心目录”**：`resolveCoreRoot` 以前只探测 npm 全局路径
+  （`/usr/local/lib`、`/opt/homebrew/lib`、`npm root -g`），而 `dsh` 从 `~/.dsh` 启动时核心模块并不在这些位置，于是永远探测不到。
+  现在按优先级探测：`--root` / `DSH_CORE_DIR` → 插件自身目录链的祖先（`<profile>/node_modules/<plugin>` → `<profile>`）→
+  `~/.dsh`、`~/.dsh/profiles` 及各 profile → `/usr/local`、`/opt/homebrew`、`npm root -g`、`pnpm root -g` 与 pnpm 全局目录
+  （含 `.pnpm/node_modules`）。探测失败时列出全部候选路径，便于用 `--root` 指定。
+
+### 新增
+
+- `patch:where`（`node patches/patch-core.mjs where`）：打印实际命中的 dsh 核心目录。
+
 ## [0.5.2] - 2026-09-08
 
 ### 修复

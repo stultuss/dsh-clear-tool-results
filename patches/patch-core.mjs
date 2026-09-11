@@ -30,10 +30,10 @@
  *   status 显示补丁状态。
  */
 import { spawnSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const BACKUP_DIR = join(homedir(), '.dsh', 'clear-tool-results-backups')
@@ -88,19 +88,104 @@ const EDITS = [
 ]
 
 /** 定位 dsh 核心安装目录（含 node_modules/@deepseek-ai/dsh-session）。 */
-export function resolveCoreRoot(explicit) {
-  const candidates = []
-  if (explicit) candidates.push(explicit)
-  if (process.env.DSH_CORE_DIR) candidates.push(process.env.DSH_CORE_DIR)
-  candidates.push('/usr/local/lib/node_modules/@deepseek-ai/dsh')
-  candidates.push('/opt/homebrew/lib/node_modules/@deepseek-ai/dsh')
+/** 由内向外逐级向上探测：<profile>/node_modules/<plugin>/patches → … → 家目录。 */
+function ancestorRoots() {
+  const dirs = []
+  let dir = fileURLToPath(new URL('.', import.meta.url))
+  for (let depth = 0; depth < 8; depth += 1) {
+    dirs.push(dir)
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return dirs
+}
+
+function readDirs(dir) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(dir, entry.name))
+  } catch {
+    return []
+  }
+}
+
+/** dsh 自身目录：~/.dsh、~/.dsh/profiles、~/.dsh/profiles/<name> 及其 node_modules。 */
+function dshProfileRoots() {
+  const home = homedir()
+  const roots = [join(home, '.dsh'), join(home, '.dsh', 'profiles'), join(home, '.dsh', 'profiles', 'node_modules')]
+  for (const profile of readDirs(join(home, '.dsh', 'profiles'))) {
+    roots.push(profile, join(profile, 'node_modules'))
+  }
+  return roots
+}
+
+/** pnpm 全局目录：<prefix>/global/<vN>/<hash>/node_modules，以及提升后的 .pnpm/node_modules。 */
+function pnpmGlobalRoots() {
+  const prefixes = [
+    join(homedir(), 'Library', 'pnpm'),
+    join(homedir(), '.local', 'share', 'pnpm'),
+    join(homedir(), 'AppData', 'Local', 'pnpm'),
+    join(homedir(), '.pnpm'),
+  ]
+  const roots = []
+  for (const prefix of prefixes) {
+    for (const version of readDirs(join(prefix, 'global'))) {
+      for (const hash of readDirs(version)) {
+        const nodeModules = join(hash, 'node_modules')
+        roots.push(nodeModules, join(nodeModules, '.pnpm', 'node_modules'))
+      }
+    }
+    roots.push(join(prefix, 'global', 'node_modules'))
+  }
+  return roots
+}
+
+function* candidateRoots(explicit) {
+  yield explicit
+  yield process.env.DSH_CORE_DIR
+  yield* ancestorRoots()
+  yield* dshProfileRoots()
+  yield '/usr/local/lib/node_modules/@deepseek-ai/dsh'
+  yield '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh'
   const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' })
   if (npmRoot.status === 0 && npmRoot.stdout.trim()) {
-    candidates.push(join(npmRoot.stdout.trim(), '@deepseek-ai/dsh'))
+    yield join(npmRoot.stdout.trim(), '@deepseek-ai/dsh')
+    yield npmRoot.stdout.trim()
   }
-  for (const candidate of candidates) {
+  const pnpmRoot = spawnSync('pnpm', ['root', '-g'], { encoding: 'utf8' })
+  if (pnpmRoot.status === 0 && pnpmRoot.stdout.trim()) yield pnpmRoot.stdout.trim()
+  yield* pnpmGlobalRoots()
+}
+
+function isCoreRoot(root) {
+  return existsSync(join(root, SESSION_REL)) && existsSync(join(root, AGENT_LOOP_REL))
+}
+
+/** 列出全部候选目录及探测结果，用于排错与 --json 输出。 */
+export function coreRootCandidates(explicit) {
+  const seen = new Set()
+  const list = []
+  for (const candidate of candidateRoots(explicit)) {
+    if (!candidate) continue
     const root = resolve(candidate)
-    if (existsSync(join(root, SESSION_REL)) && existsSync(join(root, AGENT_LOOP_REL))) return root
+    if (seen.has(root)) continue
+    seen.add(root)
+    list.push({ root, ok: isCoreRoot(root) })
+  }
+  return list
+}
+
+/** 定位 dsh 核心目录：显式 --root / DSH_CORE_DIR 优先，其次插件所在目录链、dsh profile，最后全局安装位置。 */
+export function resolveCoreRoot(explicit) {
+  const seen = new Set()
+  for (const candidate of candidateRoots(explicit)) {
+    if (!candidate) continue
+    const root = resolve(candidate)
+    if (seen.has(root)) continue
+    seen.add(root)
+    if (isCoreRoot(root)) return root
   }
   return null
 }
@@ -253,7 +338,9 @@ function main(argv) {
   const asJson = args.includes('--json')
   const root = resolveCoreRoot(explicitRoot)
   if (!root) {
-    console.error('未定位到 dsh 核心目录：请用 --root <dsh 安装目录> 或设置 DSH_CORE_DIR。')
+    console.error('未定位到 dsh 核心目录：请用 --root <dsh 安装目录> 或设置 DSH_CORE_DIR（需包含 node_modules/@deepseek-ai/dsh-session 与 dsh-agent-loop）。')
+    console.error('已探测的候选目录（均不满足条件）：')
+    for (const item of coreRootCandidates(explicitRoot)) console.error(`  · ${item.root}`)
     process.exitCode = 1
     return
   }
@@ -261,6 +348,10 @@ function main(argv) {
     if (command === 'status') {
       const status = patchStatus(root)
       console.log(asJson ? JSON.stringify(status, null, 2) : formatStatus(status))
+      return
+    }
+    if (command === 'where') {
+      console.log(asJson ? JSON.stringify({ root }, null, 2) : root)
       return
     }
     if (command === 'apply') {
@@ -277,7 +368,7 @@ function main(argv) {
         : '核心补丁未应用，无需回退。')
       return
     }
-    console.error(`未知命令：${command}（可用：status / apply / revert）`)
+    console.error(`未知命令：${command}（可用：where / status / apply / revert）`)
     process.exitCode = 1
   } catch (error) {
     console.error(`补丁操作失败：${error instanceof Error ? error.message : String(error)}`)

@@ -154,10 +154,15 @@ append 一个 `request/header {reason:"series"}`，Chat 界面就为每个系列
 
 ```sh
 cd ~/.dsh/profiles/web/node_modules/dsh-clear-tool-results
+npm run patch:where    # 打印探测到的 dsh 核心目录
 npm run patch:status   # 状态
 npm run patch:apply    # 应用（自动备份到 ~/.dsh/clear-tool-results-backups/）
 npm run patch:revert   # 回退
 ```
+
+核心目录按 `--root` / `DSH_CORE_DIR` → 插件自身所在目录链（`<profile>/node_modules/<plugin>` → `<profile>`）→
+`~/.dsh`、`~/.dsh/profiles` 及各 profile → `/usr/local`、`/opt/homebrew`、`npm root -g`、`pnpm root -g` 与 pnpm
+全局目录的顺序自动探测；探测失败时会列出全部候选路径，可据此用 `--root <目录>` 指定。
 
 打补丁后的边界语义：每轮**恰好一次**系列边界——轮末的普通 replace（清除本轮剩余结果；空轮或
 被中断的轮则由 `nudgeSeries` 做一次内容不变的替换）使 `seriesGeneration` +1，下一轮首条请求

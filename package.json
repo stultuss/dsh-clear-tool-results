@@ -31,6 +31,7 @@
   ],
   "scripts": {
     "patch:status": "node patches/patch-core.mjs status",
+    "patch:where": "node patches/patch-core.mjs where",
     "patch:apply": "node patches/patch-core.mjs apply",
     "patch:revert": "node patches/patch-core.mjs revert"
   },
