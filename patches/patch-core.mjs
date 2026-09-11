@@ -12,10 +12,26 @@
  *   双代数：
  *     · `replaceGeneration` 保持原语义（任何 replace 都 +1）—— 投影缓存、压缩轮询、
  *       客户端镜像都依赖它，绝不能改。
- *     · 新增 `seriesGeneration`：只有「非清除型」replace 才 +1。插件逐步清除时给
- *       surfaceOp 打上 `impact:"clear"`，因此不再开启新系列。
+ *     · 新增 `seriesGeneration`：只有「非清除型」replace 才 +1。判定「清除型」的依据是
+ *       替换是否改写了 tool/result 的内容（见下），因此不再开启新系列。
  *   agent-loop 的系列判定改读 `seriesGeneration`（缺失时回退 `replaceGeneration`，
  *   所以两个文件可以独立应用/回退，任一侧未打补丁都保持原行为）。
+ *
+ * 「清除型」怎么判定（v4 起的约定）
+ *   事件上不能带任何自定义标记：
+ *     · surfaceOp 只允许 3 个键（op / startSeq / endSeq）。浏览器端
+ *       dsh-api-session-controller / dsh-client-connection 的 assertSessionWireEvent → isReplaceOp
+ *       严格按 3 键校验且不做归一化，第 4 个键会让 follow 流里那一帧抛
+ *       `session event "tool/result" carries an invalid replace surfaceOp`；follow 流是所有
+ *       会话共用的，整块 UI 会一起卡死（每个会话都报历史加载失败）。
+ *     · data 只允许改 `message.content[0].content`（assertToolResultRewrite），
+ *       加任何其它字段都会被拒。
+ *   所以判定改成看事实本身：单节点 tool/result 替换**改写了内容** = 内容清除（不开新系列）；
+ *   内容逐字节不变 = 插件用来划分轮次系列边界的那次替换（照旧开新系列）。
+ *   顺带地，核心自带的 compaction-tool-result-pruner 的修剪也不再产生新系列 ——
+ *   它同样只是改写 tool/result 内容。
+ *   isReplaceOp 因此只接受 3 键：任何旧版本插件写出的 4 键 op 都会在宿主侧被拒绝 ——
+ *   清除失败（记 warning），但会话不受影响。
  *
  * 多代适配
  *   核心有两条代码谱系，差异不只是版本号，所以按「位点变体」适配而不是解析版本号：
@@ -33,8 +49,9 @@
  *   每个位点可挂多个变体，apply 时挑选当前文件里恰好匹配的那一个；任一位点无变体匹配
  *   → 整体拒绝写入（先全量校验、后落盘），绝不产生半补丁状态。
  *
- *   跨代拼写兼容：isReplaceOp 同时接受两种键拼写并就地归一化到本代规范拼写，
- *   因此旧核心写入的历史会话日志也能在新核心上折叠重放（反向亦然）。
+ *   跨代拼写兼容：isReplaceOp 同时接受两种键拼写，并**只解析、不改写**（>=0.1.5 的核心
+ *   先深冻结事件、后校验 surfaceOp，就地归一化会抛 TypeError: not extensible）。
+ *   旧拼写在 `surfaceOpOf` 返回时被解析成本代键名，fold 因此照样能重放旧核心写入的会话日志。
  *
  *   历史补丁态：v1 补丁写出的文本也登记在 `from` 列表里，所以已经装过 v1 的核心
  *   可以就地升级到 v2，revert 仍能回到原始文件。
@@ -81,6 +98,80 @@ const V1_REPLACE_OP_SHAPE =
   '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);'
 
 /**
+ * v2 补丁写出的 isReplaceOp 文本（>=0.1.5 态，用于就地升级）。
+ * 它在冻结的 op 上就地写 startSeq，而 >=0.1.5 的核心是「先深冻结事件、后校验 surfaceOp」，
+ * 因此该写法在 0.1.5 上会抛 TypeError: Cannot add property startSeq, object is not extensible。
+ */
+export const V2_SEQ_REPLACE_OP_SHAPE =
+  '\tif (op === null || typeof op !== "object") return false;\n' +
+  '\tconst keys = Object.keys(op);\n' +
+  '\t// 跨代兼容：旧核心写入的日志用 start/end，就地归一化为本代拼写\n' +
+  '\tif (Object.hasOwn(op, "start") && !Object.hasOwn(op, "startSeq")) {\n' +
+  '\t\top["startSeq"] = op["start"];\n' +
+  '\t\top["endSeq"] = op["end"];\n' +
+  '\t\tdelete op["start"];\n' +
+  '\t\tdelete op["end"];\n' +
+  '\t}\n' +
+  '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && op["op"] === "replace" && isEventSeq(op["startSeq"]) && isEventSeq(op["endSeq"]);'
+
+/** v3 补丁写出的 isReplaceOp 文本（两代；放行第 4 个键 impact:"clear"，v4 起废弃）。 */
+export const V3_LEGACY_REPLACE_OP_SHAPE =
+  '\tif (op === null || typeof op !== "object") return false;\n' +
+  '\tconst keys = Object.keys(op);\n' +
+  '\t// 跨代兼容：新核心写入的日志用 startSeq/endSeq，就地归一化为本代拼写\n' +
+  '\tif (Object.hasOwn(op, "startSeq") && !Object.hasOwn(op, "start")) {\n' +
+  '\t\top["start"] = op["startSeq"];\n' +
+  '\t\top["end"] = op["endSeq"];\n' +
+  '\t\tdelete op["startSeq"];\n' +
+  '\t\tdelete op["endSeq"];\n' +
+  '\t}\n' +
+  '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);'
+
+export const V3_SEQ_REPLACE_OP_SHAPE =
+  '\tif (op === null || typeof op !== "object") return false;\n' +
+  '\tconst keys = Object.keys(op);\n' +
+  '\t// 跨代兼容：旧核心写入的日志用 start/end。核心在写入前深冻结事件，\n' +
+  '\t// 所以这里只解析、不改写（就地归一化会在冻结的 op 上抛 TypeError）。\n' +
+  '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && op["op"] === "replace" && (Object.hasOwn(op, "startSeq") ? isEventSeq(op["startSeq"]) : isEventSeq(op["start"])) && (Object.hasOwn(op, "endSeq") ? isEventSeq(op["endSeq"]) : isEventSeq(op["end"]));'
+
+/** v3 补丁写出的 surfaceOpOf 文本（把 surfaceOp 上的 impact 原样带进 fold）。 */
+const V3_SURFACE_OP_OF =
+  '\tif (!isReplaceOp(op)) throw new Error(`session event "${event.type}" carries an invalid replace surfaceOp`);\n' +
+  '\tif (Object.hasOwn(op, "startSeq")) return op;\n' +
+  '\treturn { op: "replace", startSeq: op["start"], endSeq: op["end"], ...(Object.hasOwn(op, "impact") ? { impact: op["impact"] } : {}) };'
+
+/**
+ * v4：replace op 恒为 3 键，只解析、不改写；跨代拼写仍然兼容。
+ * 第 4 个键会被浏览器端 wire 校验拒绝，所以这里必须拒绝它（见文件头说明）。
+ */
+const V4_SEQ_REPLACE_OP_SHAPE =
+  '\tif (op === null || typeof op !== "object") return false;\n' +
+  '\t// 跨代兼容：旧核心写入的日志用 start/end。核心在写入前深冻结事件，\n' +
+  '\t// 所以这里只解析、不改写（就地归一化会在冻结的 op 上抛 TypeError）。\n' +
+  '\t// 只接受 3 键：第 4 个键会被浏览器端 wire 校验拒绝，导致整块 UI 卡死。\n' +
+  '\treturn Object.keys(op).length === 3 && Object.hasOwn(op, "op") && op["op"] === "replace" && (Object.hasOwn(op, "startSeq") ? isEventSeq(op["startSeq"]) : isEventSeq(op["start"])) && (Object.hasOwn(op, "endSeq") ? isEventSeq(op["endSeq"]) : isEventSeq(op["end"]));'
+
+const V4_SURFACE_OP_OF =
+  '\tif (!isReplaceOp(op)) throw new Error(`session event "${event.type}" carries an invalid replace surfaceOp`);\n' +
+  '\tif (Object.hasOwn(op, "startSeq")) return op;\n' +
+  '\treturn { op: "replace", startSeq: op["start"], endSeq: op["end"] };'
+
+/**
+ * v4：判定「清除型替换」的辅助函数 —— 单节点 tool/result 替换改写了内容即为清除。
+ * 事件上不能带自定义标记（surfaceOp 只能 3 键、data 只能改 content，见文件头）。
+ */
+export const CLEAR_IMPACT_HELPER = [
+  '/** 该替换是否只是改写了单个 tool/result 的内容（= 内容清除，不开启新系列）。 */',
+  'function clearsToolResultContent(event, shadowedSeqs, events, baseSeq) {',
+  '\tif (event.type !== "tool/result" || shadowedSeqs.length !== 1) return false;',
+  '\tconst original = events[shadowedSeqs[0] - baseSeq];',
+  '\tif (original?.type !== "tool/result") return false;',
+  '\treturn !isDeepEqualJson(original.data?.message?.content?.[0]?.content, event.data?.message?.content?.[0]?.content);',
+  '}',
+  '',
+].join('\n')
+
+/**
  * 各补丁位点。
  *   variants: [{ gens, pairs: [{ from: [...可接受的现状文本], to: 补丁后文本 }] }]
  *   · from[0] 必为原始（未打补丁）文本，revert 会回到它；
@@ -109,7 +200,7 @@ const EDITS = [
   {
     file: SESSION_REL,
     id: 'session:replace-op-shape',
-    note: 'isReplaceOp 放行第 4 个键 impact:"clear"，并兼容另一代的键拼写',
+    note: 'replace op 只接受 3 键（并兼容另一代的键拼写）',
     variants: [
       {
         gens: [GEN_LEGACY],
@@ -118,6 +209,7 @@ const EDITS = [
             from: [
               '\treturn Object.keys(op).length === 3 && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);',
               V1_REPLACE_OP_SHAPE,
+              V3_LEGACY_REPLACE_OP_SHAPE,
             ],
             to:
               '\tif (op === null || typeof op !== "object") return false;\n' +
@@ -129,7 +221,7 @@ const EDITS = [
               '\t\tdelete op["startSeq"];\n' +
               '\t\tdelete op["endSeq"];\n' +
               '\t}\n' +
-              '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);',
+              '\treturn keys.length === 3 && Object.hasOwn(op, "op") && Object.hasOwn(op, "start") && Object.hasOwn(op, "end") && op["op"] === "replace" && isEventSeq(op["start"]) && isEventSeq(op["end"]);',
           },
         ],
       },
@@ -139,18 +231,38 @@ const EDITS = [
           {
             from: [
               '\treturn Object.keys(op).length === 3 && Object.hasOwn(op, "op") && Object.hasOwn(op, "startSeq") && Object.hasOwn(op, "endSeq") && op["op"] === "replace" && isEventSeq(op["startSeq"]) && isEventSeq(op["endSeq"]);',
+              V2_SEQ_REPLACE_OP_SHAPE,
+              V3_SEQ_REPLACE_OP_SHAPE,
+            ],
+            to: V4_SEQ_REPLACE_OP_SHAPE,
+          },
+          {
+            // surfaceOpOf 返回的 op 就是 fold 用的 op：跨代（旧日志）拼写在这里解析成本代键名
+            from: [
+              '\tif (!isReplaceOp(op)) throw new Error(`session event "${event.type}" carries an invalid replace surfaceOp`);\n\treturn op;',
+              V3_SURFACE_OP_OF,
+            ],
+            to: V4_SURFACE_OP_OF,
+          },
+        ],
+      },
+    ],
+  },
+  {
+    file: SESSION_REL,
+    id: 'session:clear-impact-helper',
+    note: '新增 clearsToolResultContent（改写了内容的单节点 tool/result 替换 = 清除型）',
+    variants: [
+      {
+        gens: [GEN_LEGACY, GEN_SEQ],
+        pairs: [
+          {
+            from: [
+              '/** Validate one event at its replay boundary and prepare its atomic fold transition. */\nfunction planSurfaceEvent(state, event, expectedSeq, events, baseSeq) {',
             ],
             to:
-              '\tif (op === null || typeof op !== "object") return false;\n' +
-              '\tconst keys = Object.keys(op);\n' +
-              '\t// 跨代兼容：旧核心写入的日志用 start/end，就地归一化为本代拼写\n' +
-              '\tif (Object.hasOwn(op, "start") && !Object.hasOwn(op, "startSeq")) {\n' +
-              '\t\top["startSeq"] = op["start"];\n' +
-              '\t\top["endSeq"] = op["end"];\n' +
-              '\t\tdelete op["start"];\n' +
-              '\t\tdelete op["end"];\n' +
-              '\t}\n' +
-              '\treturn (keys.length === 3 || (keys.length === 4 && op["impact"] === "clear")) && Object.hasOwn(op, "op") && op["op"] === "replace" && isEventSeq(op["startSeq"]) && isEventSeq(op["endSeq"]);',
+              CLEAR_IMPACT_HELPER +
+              '/** Validate one event at its replay boundary and prepare its atomic fold transition. */\nfunction planSurfaceEvent(state, event, expectedSeq, events, baseSeq) {',
           },
         ],
       },
@@ -159,16 +271,20 @@ const EDITS = [
   {
     file: SESSION_REL,
     id: 'session:plan-passthrough',
-    note: 'planSurfaceEvent 把 impact 透传进 plan',
+    note: 'planSurfaceEvent 把「内容清除」判定结果放进 plan.impact',
     variants: [
       {
         gens: [GEN_LEGACY],
         pairs: [
           {
             from: [
-              '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\t...range\n\t};',
+              '\tassertToolResultRewrite(event, range.shadowedSeqs, events, baseSeq);\n\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\t...range\n\t};',
+              '\tassertToolResultRewrite(event, range.shadowedSeqs, events, baseSeq);\n\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\timpact: surfaceOp.impact,\n\t\t...range\n\t};',
             ],
-            to: '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\timpact: surfaceOp.impact,\n\t\t...range\n\t};',
+            to:
+              '\tassertToolResultRewrite(event, range.shadowedSeqs, events, baseSeq);\n' +
+              '\tconst impact = clearsToolResultContent(event, range.shadowedSeqs, events, baseSeq) ? "clear" : undefined;\n' +
+              '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.start,\n\t\tend: surfaceOp.end,\n\t\timpact,\n\t\t...range\n\t};',
           },
         ],
       },
@@ -176,8 +292,14 @@ const EDITS = [
         gens: [GEN_SEQ],
         pairs: [
           {
-            from: ['start: surfaceOp.startSeq,'],
-            to: 'start: surfaceOp.startSeq,\n\t\timpact: surfaceOp.impact,',
+            from: [
+              '\tassertSystemHeadRewrite(event, state, range.startIdx, range.shadowedSeqs, events, baseSeq);\n\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.startSeq,\n\t\tend: surfaceOp.endSeq,\n\t\t...range\n\t};',
+              '\tassertSystemHeadRewrite(event, state, range.startIdx, range.shadowedSeqs, events, baseSeq);\n\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.startSeq,\n\t\timpact: surfaceOp.impact,\n\t\tend: surfaceOp.endSeq,\n\t\t...range\n\t};',
+            ],
+            to:
+              '\tassertSystemHeadRewrite(event, state, range.startIdx, range.shadowedSeqs, events, baseSeq);\n' +
+              '\tconst impact = clearsToolResultContent(event, range.shadowedSeqs, events, baseSeq) ? "clear" : undefined;\n' +
+              '\treturn {\n\t\tkind: "replace",\n\t\tseq: event.seq,\n\t\tstart: surfaceOp.startSeq,\n\t\timpact,\n\t\tend: surfaceOp.endSeq,\n\t\t...range\n\t};',
           },
         ],
       },

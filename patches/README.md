@@ -18,8 +18,9 @@ Chat 界面为每个系列渲染一次系统提示词 —— 结果就是每步�
 | 位点 | `<= 0.1.4`（legacy） | `>= 0.1.5`（seq） |
 | --- | --- | --- |
 | `session:fold-state` | `createFoldState()` 增加 `seriesGeneration: 0` | 文本未变，共用 |
-| `session:replace-op-shape` | `isReplaceOp` 放行第 4 个键 `impact:"clear"` | 核心改用 `startSeq/endSeq` + `Object.hasOwn`/`isEventSeq` 校验，需独立锚点 |
-| `session:plan-passthrough` | `planSurfaceEvent` 把 `impact` 透传进 plan | 键名变为 `startSeq/endSeq`，需独立锚点 |
+| `session:replace-op-shape` | `isReplaceOp` 只接受 3 键（第 4 键 `impact` 会被浏览器端 wire 校验拒绝）；兼容另一代键拼写，只解析不改写 | 核心改用 `startSeq/endSeq` + `Object.hasOwn`/`isEventSeq` 校验，需独立锚点 |
+| `session:clear-impact-helper` | 新增 `clearsToolResultContent(event, shadowedSeqs, events, baseSeq)`：单节点 tool/result 替换改写了内容即为「清除型」 | 文本未变，共用 |
+| `session:plan-passthrough` | `planSurfaceEvent` 调 `clearsToolResultContent(...)` 并把结果写进 `plan.impact` | 键名变为 `startSeq/endSeq`，需独立锚点 |
 | `session:series-counter` | `applySurfacePlan` 的 replace 分支：`replaceGeneration += 1` 照旧，仅当 `plan.impact !== "clear"` 时 `seriesGeneration += 1` | 文本未变，共用 |
 | `session:series-getter` | surface 暴露 `seriesGeneration` getter | 文本未变，共用 |
 | `agent-loop:series-generation` | 单处：局部量 `const surfaceGeneration = …seriesGeneration ?? …replaceGeneration`（比较与重捕获都走它） | 三处：构造期捕获 + 系统提示投影比较 + buildRequest 局部量（新增 `startsRequestSeries` / `toolsChanged(...)` 输入） |
@@ -41,29 +42,41 @@ alpha / rc 的版本排序不可靠，而代码谱系是确定的。
 
 * 每个位点登记多个「变体」，apply 时挑选当前文件里唯一匹配的那一个；任一位点无变体匹配
   → 整体拒绝写入（先全量校验、后落盘），不会留下半补丁状态。
-* **跨代拼写兼容**：补丁后的 `isReplaceOp` 同时接受 `start/end` 与 `startSeq/endSeq` 两种拼写，
-  并就地归一化到本代规范拼写 —— 于是旧核心写入的历史会话日志能在新核心上折叠重放（反向亦然）。
-* **历史补丁态可升级**：v1 补丁写出的文本也登记在 `from` 列表里，装过 v1 的核心执行 `apply`
-  会就地升级到 v2，`revert` 仍回到原始文件。
-* 插件运行时按代数选择 op 键名；若判断有误，首次写入被核心拒绝后会换另一代拼写重试一次并记住
-  （核心的 `surfaceOp` 校验先于写入，失败尝试不会污染会话日志）。
+* **跨代拼写兼容（只解析、不改写）**：补丁后的 `isReplaceOp` 同时接受 `start/end` 与 `startSeq/endSeq`
+  两种拼写，`surfaceOpOf` 把旧拼写解析成本代键名后交给 fold —— 于是旧核心写入的历史会话日志能在
+  新核心上折叠重放（反向亦然）。
+  ⚠️ **不能就地改写 op 对象**：`>= 0.1.5` 的 `Session.append()` 先 `deepFreeze(event)` 再校验 `surfaceOp`，
+  在冻结对象上写 `startSeq` 会抛 `TypeError: Cannot add property startSeq, object is not extensible`；
+  v2 补丁正是这么写的，导致 0.1.5 上每一次清除都失败（`v3` 已改为只解析）。
+* **历史补丁态可升级**：v1（旧拼写 3 键）、v2（就地归一化）与 v3（4 键 `impact`）补丁写出的文本都登记在
+  `from` 列表里，装过旧版补丁的核心执行 `apply` 会就地升级到 v4（只解析、3 键、内容判定），
+  `revert` 仍回到原始文件。
+* 插件运行时按代数选择 op 键名（默认按 `>= 0.1.5` 的 `startSeq/endSeq`）；若判断有误，首次写入被
+  核心拒绝后会换另一代拼写重试一次并记住（核心的 `surfaceOp` 校验先于写入，失败尝试不会污染会话日志），
+  插件载入时也会用本管理器按核心源码校准一次。
 
-验证套件（对每个代数跑「原始 → 应用 → 功能断言 → 回退」闭环）：
+验证套件（对每个代数跑「原始 → 应用 → 功能断言 → 回退」闭环，含冻结 op 断言与 v2 → v3 就地升级）：
 
 ```bash
 npm run check:compat        # 从 npm 拉取各版本核心（需要网络）
 node patches/check-harness-compat.mjs --tree legacy=/path/to/0.1.2 --tree seq=/path/to/0.1.5
-node patches/check-harness-compat.mjs --v1-tree /usr/local/lib/node_modules/@deepseek-ai/dsh   # 额外验证 v1 → v2 就地升级
+node patches/check-harness-compat.mjs --v1-tree /usr/local/lib/node_modules/@deepseek-ai/dsh   # 额外验证 v1 → v3 就地升级
 ```
 
 ## 插件侧的配合
 
-* 逐步清除（`step/end`）时给 `surfaceOp` 加 `impact:"clear"`，**且仅在探测到核心已暴露
-  `seriesGeneration` 时才加**（否则旧核心的 `isReplaceOp` 会拒绝 4 键 op）。
-* 轮末清除（`turn/end`）保持普通 replace：它每轮只发生一次，正好让下一轮出现一个系列边界，
-  Chat 界面每轮展示一次系统提示词。
-* 若轮内结果已被逐步清除干净，轮末会做一次内容不变的普通替换（`nudgeSeries`），
-  保证「每轮一次」稳定成立。
+* **事件上不带任何自定义标记**——两条路都被核心封死，所以「清除型」由核心看事实判定：
+  * `surfaceOp` 只允许 3 个键（`op`/`startSeq`/`endSeq`）。浏览器端 `assertSessionWireEvent → isReplaceOp`
+    严格按 3 键校验且明确不做归一化，第 4 个键会让**所有会话共用的 follow 流**里那一帧抛
+    `session event "tool/result" carries an invalid replace surfaceOp`，整块 UI 一起卡死
+    （每个会话都显示红色「历史加载失败」）。
+  * `data` 只允许改 `message.content[0].content`（`assertToolResultRewrite`），加任何其它字段都会被拒。
+  * 因此：**内容被改写的单节点 tool/result 替换 = 内容清除**（不推进 `seriesGeneration`）；
+    **内容逐字节不变 = 系列边界**（照旧 +1）。核心自带的 `compaction-tool-result-pruner` 同样受益。
+* 每轮结束时由 `nudgeSeries` 做一次**内容不变的普通 replace**，作为该轮唯一的系列边界
+  （普通模式要求本轮确有结果被清除；overclock 无论如何都补一次）。插件会对比这次替换前后的
+  `seriesGeneration`，没推进就告警（说明替换内容与原文不一致，被核心判成了清除型）。
+* 系列边界因此稳定为「每轮恰好一次」：`seriesGeneration` 不再被任何一条工具结果的清除推动。
 
 ## 命令绑定
 

@@ -13,12 +13,21 @@
 // 故普通模式清除在上一轮 turn/end 执行；overclock 在 step/end 事件后、下一步
 // prompt 组装前（queueMicrotask + 先清除后异步归档）执行。
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises'
-import { readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 export const name = 'dsh-clear-tool-results'
 export const inject = ['commands', 'tools', 'sessionPersistence']
+
+/** 本份代码的版本（/clear-tool-results status 显示，用于确认加载的是哪一份构建）。 */
+const PLUGIN_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? '未知'
+  } catch {
+    return '未知'
+  }
+})()
 
 const TOOL_RESULT = 'tool/result'
 const TOOL_CALL = 'tool/call'
@@ -37,6 +46,8 @@ const LOG_DIR_NAME = 'tool-result-logs'
 const INDEX_FILE = 'index.json'
 const STATE_FILE = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'clear-tool-results.json')
 const SESSIONS_ROOT = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'sessions')
+/** 告警日志（只在异常路径写）。 */
+const WARN_LOG_FILE = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'clear-tool-results.log')
 
 /** 载入核心补丁管理器（与本插件同仓库）；不可用时返回 null。 */
 async function loadPatchManager() {
@@ -54,8 +65,8 @@ async function syncCorePatch(action) {
   try {
     const root = manager.resolveCoreRoot()
     if (!root) return '（未定位到 dsh 核心目录，可手动运行 npm run patch:apply -- --root <dsh 目录>）'
-  // 顺带校准 surface op 键名：>= 0.1.5 的核心要求 startSeq/endSeq
-  surfaceOpKeyNames = manager.surfaceOpKeys?.(root) ?? surfaceOpKeyNames
+    // 顺带校准 surface op 键名：>= 0.1.5 的核心要求 startSeq/endSeq
+    rememberOpKeys(manager.surfaceOpKeys?.(root))
     if (action === 'apply') {
       const result = manager.applyPatches(root)
       return result.changed ? '；核心补丁已应用，重启 dsh GUI 后生效' : '；核心补丁已处于应用状态'
@@ -64,6 +75,17 @@ async function syncCorePatch(action) {
     return result.changed ? '；核心补丁已回退，重启 dsh GUI 后生效' : '；核心补丁未应用，无需回退'
   } catch (error) {
     return `（补丁操作失败：${String(error?.message ?? error)}；可手动运行 npm run patch:apply 或 patch:revert）`
+  }
+}
+
+/** 载入时按核心源码校准 surface op 键名；校准失败时按会话头版本兜底（见 preferredOpKeys）。 */
+async function calibrateSurfaceOpKeys() {
+  const manager = await loadPatchManager()
+  if (!manager?.surfaceOpKeys) return
+  try {
+    rememberOpKeys(manager.surfaceOpKeys())
+  } catch {
+    // 未定位到核心目录：保持未校准，写入时按会话头版本选择拼写
   }
 }
 
@@ -90,8 +112,38 @@ async function corePatchStatusLine() {
   }
 }
 
+/**
+ * 插件告警：既交给 ctx.logger，也追加到 $DSH_HOME/clear-tool-results.log。
+ * 宿主默认不把 logger 写到任何可读文件，清除失败就完全看不见——排查时无据可查，
+ * 所以这里自己落一份（只在异常路径写，正常路径不产生任何 I/O）。
+ */
+/** 追踪一行（清除决策链路的每一步），与告警写同一个文件，便于一次复现就定位。 */
+function trace(message) {
+  try {
+    appendFileSync(WARN_LOG_FILE, `${new Date().toISOString()} [trace] ${message}\n`, 'utf8')
+  } catch {
+    // 追踪失败不影响主流程
+  }
+}
+
+function warn(ctx, message) {
+  const line = `${new Date().toISOString()} ${message}`
+  try {
+    ctx?.logger?.warn?.('dsh-clear-tool-results: ' + message)
+  } catch {
+    // logger 不可用时只写文件
+  }
+  try {
+    appendFileSync(WARN_LOG_FILE, line + '\n', 'utf8')
+  } catch {
+    // 日志写入失败不影响主流程
+  }
+}
+
 export function apply(ctx) {
   const disposers = []
+  // 载入即校准 surface op 键名（<=0.1.4 → start/end，>=0.1.5 → startSeq/endSeq）
+  calibrateSurfaceOpKeys().catch(() => {})
   disposers.push(ctx.commands.register({
     name: 'clear-tool-results',
     description: '工具结果归档并清除开关：普通模式每轮结束归档并清除；overclock 模式在同一轮内逐步归档并滞后一步清除，需更早结果时模型可 read_tool_result_log(turn, step) 取回。用法：/clear-tool-results on|off|status|overclock',
@@ -104,7 +156,7 @@ export function apply(ctx) {
         await writeState({ enabled: true, mode: MODE_ROUND })
         if (agent?.session) {
           queueMicrotask(() => {
-            enableNow(ctx, agent.session).catch((error) => ctx.logger.warn('dsh-clear-tool-results: ' + String(error)))
+            enableNow(ctx, agent.session).catch((error) => warn(ctx, String(error)))
           })
         }
         return { kind: 'success', text: '已启用（普通模式）：工具结果按轮归档，并在下一轮开始前从对话清除' + patchNote }
@@ -114,7 +166,7 @@ export function apply(ctx) {
         await writeState({ enabled: true, mode: MODE_OVERCLOCK })
         if (agent?.session) {
           queueMicrotask(() => {
-            enableNow(ctx, agent.session).catch((error) => ctx.logger.warn('dsh-clear-tool-results: ' + String(error)))
+            enableNow(ctx, agent.session).catch((error) => warn(ctx, String(error)))
           })
         }
         return { kind: 'success', text: '已启用（overclock 模式）：每一步工具结果归档后滞后一步清除，更早步骤需 read_tool_result_log(turn, step) 取回' + patchNote }
@@ -131,7 +183,7 @@ export function apply(ctx) {
         const text = state.enabled
           ? `当前状态：已启用（${modeText}）`
           : `当前状态：已禁用（上次模式：${modeText}）`
-        return { kind: 'success', text: text + (await corePatchStatusLine()) }
+        return { kind: 'success', text: text + (await corePatchStatusLine()) + `\n插件版本：${PLUGIN_VERSION}` }
       }
       return { kind: 'error', text: '用法：/clear-tool-results on|off|status|overclock' }
     },
@@ -140,18 +192,18 @@ export function apply(ctx) {
     if (event.type === TURN_END) {
       const endedTurn = event.data.turn
       queueMicrotask(() => {
-        onTurnEnd(ctx, session, endedTurn).catch((error) => ctx.logger.warn('dsh-clear-tool-results: ' + String(error)))
+        onTurnEnd(ctx, session, endedTurn).catch((error) => warn(ctx, String(error)))
       })
     } else if (event.type === TURN_START) {
       const turn = event.data.turn
       queueMicrotask(() => {
-        onTurnStart(ctx, session, turn).catch((error) => ctx.logger.warn('dsh-clear-tool-results: ' + String(error)))
+        onTurnStart(ctx, session, turn).catch((error) => warn(ctx, String(error)))
       })
     } else if (event.type === STEP_END) {
       const turn = event.data.turn
       const step = event.data.step
       queueMicrotask(() => {
-        onStepEnd(ctx, session, turn, step).catch((error) => ctx.logger.warn('dsh-clear-tool-results: ' + String(error)))
+        onStepEnd(ctx, session, turn, step).catch((error) => warn(ctx, String(error)))
       })
     }
   }))
@@ -168,14 +220,24 @@ export function apply(ctx) {
 async function onTurnEnd(ctx, session, endedTurn) {
   if (!(await readEnabled())) return
   const logsDir = logsDirOf(ctx, session)
-  await enqueue(session.id, async () => {
-    // 补归档之前未归档的轮次（插件关闭/重启期间）
-    if (typeof endedTurn === 'number') await archiveUnarchived(session, endedTurn - 1, logsDir)
-    // 刷新刚结束的轮次，保证归档完整
-    if (typeof endedTurn === 'number') await archiveTurn(session, endedTurn, logsDir, true)
-  })
+  try {
+    await enqueue(session.id, async () => {
+      // 补归档之前未归档的轮次（插件关闭/重启期间）
+      if (typeof endedTurn === 'number') await archiveUnarchived(session, endedTurn - 1, logsDir)
+      // 刷新刚结束的轮次，保证归档完整
+      if (typeof endedTurn === 'number') await archiveTurn(session, endedTurn, logsDir, true)
+    })
+  } catch (error) {
+    // 归档失败不能连带跳过清除：否则工具结果会一直留在上下文里（0.1.5 上曾整轮不生效）
+    warn(ctx, '轮末归档失败 ' + String(error))
+  }
   // 普通模式清除整轮；overclock 也在此兜底清除该轮最后剩余步骤
-  clearCompletedToolResults(session, endedTurn)
+  try {
+    const cleared = clearCompletedToolResults(session, endedTurn)
+    trace(`turn/end turn=${endedTurn} 清除 ${cleared?.cleared ?? '?'} 条（surface 节点 ${session.surface.nodes.length}）`)
+  } catch (error) {
+    warn(ctx, '轮末清除失败 ' + String(error))
+  }
 }
 
 /** 记录每个会话在上一次 turn/start 时看到的系列代次，用于补齐缺失的每轮边界。 */
@@ -186,9 +248,15 @@ async function onTurnStart(ctx, session, turn) {
   // overclock 需要每轮恰好一次系列边界：若上一轮结束时没有产生边界（空轮、被中断的轮），
   // 在这里补一次内容不变的替换。仅当核心补丁提供 seriesGeneration 时启用，
   // 否则旧核心会把这次替换当成新系列，重新造成每步重复展示。
-  if (readStateSync().mode === MODE_OVERCLOCK && supportsSeriesGeneration(session)) {
+  // 插件已关闭时不再产生任何写入。
+  const state = readStateSync()
+  if (state.enabled && state.mode === MODE_OVERCLOCK && supportsSeriesGeneration(session)) {
     const generation = session.surface.seriesGeneration
-    if (lastSeriesGeneration.get(session) === generation) nudgeSeries(session, turn)
+    try {
+      if (lastSeriesGeneration.get(session) === generation) nudgeSeries(session, turn)
+    } catch (error) {
+      warn(ctx, '轮首系列边界替换失败 ' + String(error?.message ?? error))
+    }
     lastSeriesGeneration.set(session, session.surface.seriesGeneration)
   }
   if (!(await readEnabled())) return
@@ -207,9 +275,18 @@ async function onTurnStart(ctx, session, turn) {
 async function onStepEnd(ctx, session, turn, step) {
   // 时机敏感：同步读取缓存状态，先清除上一步，之后才允许异步磁盘归档
   const state = readStateSync()
-  if (!state.enabled || state.mode !== MODE_OVERCLOCK) return
+  if (!state.enabled || state.mode !== MODE_OVERCLOCK) {
+    trace(`step/end turn=${turn} step=${step} 跳过（enabled=${state.enabled} mode=${state.mode}）`)
+    return
+  }
   if (typeof turn !== 'number' || typeof step !== 'number') return
-  clearStepToolResults(session, turn, step - 1)
+  try {
+    const { cleared, matched } = clearStepToolResults(session, turn, step - 1)
+    trace(`step/end turn=${turn} step=${step}：清除 step=${step - 1} 候选 ${matched} / 已清 ${cleared}（surface 节点 ${session.surface.nodes.length}）`)
+  } catch (error) {
+    // 清除失败不能拖垮归档：否则一个被拒绝的 replace 会让之后每一步都不再归档
+    warn(ctx, '逐步清除失败 ' + String(error))
+  }
   const logsDir = logsDirOf(ctx, session)
   await enqueue(session.id, async () => {
     await archiveStep(session, turn, step, logsDir)
@@ -219,14 +296,22 @@ async function onStepEnd(ctx, session, turn, step) {
 async function enableNow(ctx, session) {
   const logsDir = logsDirOf(ctx, session)
   const openTurn = currentOpenTurn(session)
-  await enqueue(session.id, async () => {
-    await archiveUnarchived(session, Number.MAX_SAFE_INTEGER, logsDir)
-    if (openTurn !== null) await archiveTurn(session, openTurn, logsDir, true)
-  })
-  if (openTurn === null) {
-    clearCompletedToolResults(session, Number.MAX_SAFE_INTEGER)
-  } else {
-    clearCompletedToolResults(session, openTurn - 1)
+  try {
+    await enqueue(session.id, async () => {
+      await archiveUnarchived(session, Number.MAX_SAFE_INTEGER, logsDir)
+      if (openTurn !== null) await archiveTurn(session, openTurn, logsDir, true)
+    })
+  } catch (error) {
+    warn(ctx, '启用时归档失败 ' + String(error))
+  }
+  try {
+    if (openTurn === null) {
+      clearCompletedToolResults(session, Number.MAX_SAFE_INTEGER)
+    } else {
+      clearCompletedToolResults(session, openTurn - 1)
+    }
+  } catch (error) {
+    warn(ctx, '启用时清除失败 ' + String(error))
   }
 }
 
@@ -251,6 +336,9 @@ function currentOpenTurn(session) {
 /**
  * 将满足条件的 tool/result surface 节点替换为占位符。
  * 已是替换结果（surfaceOp !== 'append'）的节点跳过；幂等。
+ * 本函数只做「内容清除」：内容被改写的单节点 tool/result 替换会被核心判定为清除型，
+ * 不开启新系列，否则 Chat 界面会为每条被清除的结果渲染一次系统提示词 ——
+ * 一次批量清除（启用插件、轮末清除）能瞬间产生上百个系列，直接把前端拖死。
  */
 /** overclock：每轮仅注入一次"可见性规则"扩展占位符，键为 `${sessionId}:${turn}`。 */
 const extendedHintRounds = new Set()
@@ -260,12 +348,22 @@ function clearToolResultsWhere(session, matches) {
   const overclock = readStateSync().mode === MODE_OVERCLOCK
   const hintedThisCall = new Set()
   let cleared = 0
+  let matched = 0
+  let skippedNotAppend = 0
+  let skippedWrongType = 0
   for (const seq of nodes) {
     const original = eventsOf(session)[seq]
-    if (!original || original.type !== TOOL_RESULT) continue
-    if (original.surfaceOp !== 'append') continue
+    if (!original || original.type !== TOOL_RESULT) {
+      skippedWrongType += 1
+      continue
+    }
+    if (original.surfaceOp !== 'append') {
+      skippedNotAppend += 1
+      continue
+    }
     const data = original.data
     if (!matches(data)) continue
+    matched += 1
     const turn = data?.turn
     const step = data?.step
     const key = overclock && typeof turn === 'number' ? `${session.id}:${turn}` : null
@@ -278,32 +376,48 @@ function clearToolResultsWhere(session, matches) {
       extendedHintRounds.add(key)
       hintedThisCall.add(key)
     }
-    replaceToolResult(session, seq, data, clearedText(turn, step, extended), stepClearInProgress)
-    cleared += 1
+    // 逐条独立：某一条目标已不在 surface（被别的 replace/压缩遮蔽）时只跳过这一条，
+    // 不影响本次其余清除，也不把异常抛给调用方（逐步清除后仍要归档、轮末仍要收尾）。
+    try {
+      replaceToolResult(session, seq, data, clearedText(turn, step, extended))
+      cleared += 1
+    } catch (error) {
+      warn(null, `清除失败（目标 seq ${seq} 已不在 surface 或写入被拒）：${String(error?.message ?? error)}`)
+    }
   }
-  return cleared
+  if (matched !== cleared || skippedWrongType > 0) {
+    trace(`清除统计：候选 ${matched}、已清 ${cleared}、非 append 跳过 ${skippedNotAppend}、取不到事件 ${skippedWrongType}`)
+  }
+  return { cleared, matched }
 }
 
 /** 将轮次 <= untilTurn 的 tool/result 节点替换为占位符。 */
 function clearCompletedToolResults(session, untilTurn) {
-  const cleared = clearToolResultsWhere(session, (data) => typeof data?.turn === 'number' && data.turn <= untilTurn)
-  // overclock 的逐步清除不开启新系列；轮末再补一次普通替换，让下一轮仍有一个系列边界
-  // （Chat 每轮展示一次系统提示词）。逐步清除已把结果清空时同样需要这个边界。
-  if (cleared === 0 && readStateSync().mode === MODE_OVERCLOCK) nudgeSeries(session, untilTurn)
+  const { cleared } = clearToolResultsWhere(session, (data) => typeof data?.turn === 'number' && data.turn <= untilTurn)
+  // 清除型替换不再开启新系列（核心按「内容被改写」判定），所以每轮结束时补一次内容不变的替换，
+  // 作为该轮唯一的系列边界（Chat 每轮展示一次系统提示词）。
+  // 普通模式下没有任何可清除结果时保持旧行为（不产生边界）。
+  if (cleared > 0 || readStateSync().mode === MODE_OVERCLOCK) {
+    const before = supportsSeriesGeneration(session) ? session.surface.seriesGeneration : undefined
+    try {
+      const nudged = nudgeSeries(session, untilTurn)
+      trace(`系列边界：${nudged ? '已写入 1 次内容不变的替换' : '没有可用节点，跳过'}`)
+      // 边界替换必须做到「内容与原节点逐字节相同」，核心才会把它算作新系列。
+      // 一旦目标的占位文本与原文不同，核心会把它当成清除型替换，本轮就没有边界了。
+      if (nudged && before !== undefined && session.surface.seriesGeneration === before) {
+        warn(null, '系列边界未生效：核心把这次替换判成了内容清除（替换内容与原文不一致）')
+      }
+    } catch (error) {
+      warn(null, '系列边界替换失败 ' + String(error?.message ?? error))
+    }
+  }
+  return { cleared }
 }
 
 /** overclock：将第 turn 轮第 step 步的工具结果替换为占位符（清除型，不开启新系列）。 */
 function clearStepToolResults(session, turn, step) {
-  stepClearInProgress = true
-  try {
-    clearToolResultsWhere(session, (data) => data?.turn === turn && data?.step === step)
-  } finally {
-    stepClearInProgress = false
-  }
+  return clearToolResultsWhere(session, (data) => data?.turn === turn && data?.step === step)
 }
-
-/** 标记「本次清除属于逐步清除」：仅此时给 replace 打 impact:"clear"。 */
-let stepClearInProgress = false
 
 /**
  * 内容不变地替换一个 tool/result，用于制造一次系列边界。
@@ -869,30 +983,74 @@ function toolNameOf(data, nameByCallId) {
 /** 核心代数决定 surface op 的键名：<=0.1.4 用 start/end，>=0.1.5 用 startSeq/endSeq。 */
 const OP_KEYS_LEGACY = { start: 'start', end: 'end' }
 const OP_KEYS_SEQ = { start: 'startSeq', end: 'endSeq' }
-// 默认按当前主流代数（<=0.1.4）；首次写入若被核心拒绝会自动纠正并记住
-let surfaceOpKeyNames = OP_KEYS_LEGACY
+/**
+ * 核心拒绝这次拼写的两种信号（失败的尝试不会进入会话日志，重试是安全的）：
+ *   · 另一代核心的 isReplaceOp 直接拒绝：invalid replace surfaceOp；
+ *   · 旧补丁态核心的就地归一化碰到深冻结的 op：not extensible（>=0.1.5 冻结事件后才校验）。
+ */
+const OP_KEY_REJECTED = /invalid replace surfaceOp|not extensible/i
+// 默认按当前代数（>=0.1.5）；载入后按核心源码校准一次，见 rememberOpKeys()。
+let surfaceOpKeyNames = OP_KEYS_SEQ
+/**
+ * 核心代数：`seq`（>= 0.1.5）/ `legacy`（<= 0.1.4）/ undefined（未校准）。
+ * 未校准时用会话头的格式版本兜底（`header.version >= 3` 即 >= 0.1.5）。
+ */
+const GEN_SEQ = 'seq'
+const GEN_LEGACY = 'legacy'
+let coreGeneration
 
-function buildSurfaceOp(keys, session, seq, clearOnly) {
-  const surfaceOp = { op: 'replace', [keys.start]: seq, [keys.end]: seq }
-  // 仅当核心已打 seriesGeneration 补丁时才带 impact：未打补丁的核心 isReplaceOp 只接受 3 个键
-  if (clearOnly && supportsSeriesGeneration(session)) surfaceOp.impact = 'clear'
-  return surfaceOp
+/** 记住校准结果（由补丁管理器给出的两代键名反推代数）。 */
+function rememberOpKeys(keys) {
+  if (keys !== OP_KEYS_LEGACY && keys !== OP_KEYS_SEQ) return
+  surfaceOpKeyNames = keys
+  coreGeneration = keys === OP_KEYS_LEGACY ? GEN_LEGACY : GEN_SEQ
 }
 
-function replaceToolResult(session, seq, data, text, clearOnly = false) {
+/** 本次写入该用哪代键名。 */
+function preferredOpKeys(session) {
+  if (coreGeneration !== undefined) return surfaceOpKeyNames
+  const version = session?.header?.version
+  return typeof version === 'number' && version < 3 ? OP_KEYS_LEGACY : OP_KEYS_SEQ
+}
+
+/**
+ * 构造 replace op。
+ *
+ * 恒为 3 键的原生形态，且事件上不带任何额外标记 —— 两条路都被封死了：
+ *   · surfaceOp 放第 4 个键 → 浏览器端 wire 校验（assertSessionWireEvent → isReplaceOp
+ *     要求恰好 3 个键）会抛 `session event "tool/result" carries an invalid replace surfaceOp`，
+ *     这一帧走所有会话共用的 follow 流，整块 UI 一起卡死；
+ *   · data 放额外字段 → 核心的 assertToolResultRewrite 要求替换只允许改
+ *     `message.content[0].content`，其它任何差异都会被拒。
+ * 所以「这次替换只是内容清除」由核心自己判定：内容被改写的单节点 tool/result 替换
+ * 不开新系列；本插件用来划系列边界的那次替换内容不变，照旧开新系列。
+ */
+function buildSurfaceOp(keys, seq) {
+  return { op: 'replace', [keys.start]: seq, [keys.end]: seq }
+}
+
+function replaceToolResult(session, seq, data, text) {
   const payload = { ...data, message: clearedMessage(data.message, text) }
   const write = (keys) =>
     session.append(TOOL_RESULT, payload, {
-      surfaceOp: buildSurfaceOp(keys, session, seq, clearOnly),
+      surfaceOp: buildSurfaceOp(keys, seq),
       sourceEventSeqs: [seq],
     })
+  const keys = preferredOpKeys(session)
   try {
-    write(surfaceOpKeyNames)
+    write(keys)
   } catch (error) {
-    // 核心的 surfaceOp 校验先于写入，失败尝试不会污染会话日志；换另一代键名重试一次并记住
-    if (!/invalid replace surfaceOp/i.test(String(error?.message ?? error))) throw error
-    surfaceOpKeyNames = surfaceOpKeyNames === OP_KEYS_LEGACY ? OP_KEYS_SEQ : OP_KEYS_LEGACY
-    write(surfaceOpKeyNames)
+    if (!OP_KEY_REJECTED.test(String(error?.message ?? error))) throw error
+    // 只有核心确实是旧代时才改用 start/end。>=0.1.5 的日志若写成 start/end，
+    // 序列化层（dsh-session-log-deepseek 的 wireSurfaceOp）会把它换算成
+    // { startSeq: Number(undefined), endSeq: Number(undefined) } = NaN，
+    // 重放/加载历史时直接报 “session event "tool/result" carries an invalid replace surfaceOp”。
+    // 所以本代核心上宁可这次清除失败（由调用方记 warning），也不写另一种拼写污染会话日志。
+    if (keys === OP_KEYS_LEGACY) {
+      write(OP_KEYS_SEQ)
+      return
+    }
+    throw error
   }
 }
 
@@ -940,7 +1098,22 @@ let stateCache = (() => {
   }
 })()
 
+/**
+ * 同步读取状态文件。
+ *
+ * step/end 的清除是时序敏感的（必须在下一步组装 prompt 之前完成，不能 await），
+ * 因此这里必须**直接读文件**：只要文件里是 overclock，逐步清除就按 overclock 走。
+ * 只读内存缓存会与另一边 `readState()`（turn/end、turn/start 用）不一致——
+ * 表现就是「overclock 打开后，逐步清除不生效，只有轮末才清除」：
+ * 同步路径看到的是过期的 round，异步路径读到的是 overclock。
+ * 读失败（文件暂不可读）时保留上一次已知状态，避免中途静默切换模式。
+ */
 function readStateSync() {
+  try {
+    stateCache = normalizeState(JSON.parse(readFileSync(STATE_FILE, 'utf8')))
+  } catch {
+    // 保留 stateCache
+  }
   return stateCache
 }
 

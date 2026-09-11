@@ -29,6 +29,7 @@ const {
   GEN_LEGACY,
   GEN_SEQ,
   SESSION_REL,
+  V2_SEQ_REPLACE_OP_SHAPE,
   applyPatches,
   coreGeneration,
   patchStatus,
@@ -58,14 +59,25 @@ function assembleTree(label, sourceDir) {
   return root
 }
 
-/** 从已打补丁的 session 源码里取出 isReplaceOp 并真跑一遍。 */
-function loadIsReplaceOp(source) {
-  const start = source.indexOf('function isReplaceOp(')
-  if (start < 0) throw new Error('未找到 isReplaceOp')
+/** 截取源码里的一个顶层函数（从 function 头到下一个 "\n}"）。 */
+function extractFunctionText(source, marker) {
+  const start = source.indexOf(marker)
+  if (start < 0) throw new Error(`未找到 ${marker}`)
   const end = source.indexOf('\n}', start)
-  const body = source.slice(start, end + 2)
+  return source.slice(start, end + 2)
+}
+
+/** 从已打补丁的 session 源码里取出 isReplaceOp / surfaceOpOf 并真跑一遍（严格模式）。 */
+function loadSurfaceOpHelpers(source) {
   const isEventSeq = (value) => Number.isInteger(value) && value >= 0
-  return new Function('isEventSeq', `${body}\nreturn isReplaceOp`)(isEventSeq)
+  // 严格模式：冻结对象上的写入会抛错，从而暴露「就地归一化」这类写法
+  const factory = new Function(
+    'isEventSeq',
+    'isSurfaceEligibleType',
+    'KNOWN_SESSION_EVENT_TYPES',
+    `"use strict";\n${extractFunctionText(source, 'function isReplaceOp(')}\n${extractFunctionText(source, 'function surfaceOpOf(')}\nreturn { isReplaceOp, surfaceOpOf }`,
+  )
+  return factory(isEventSeq, () => true, new Set())
 }
 
 const failures = []
@@ -93,27 +105,50 @@ function exercise(label, treeRoot, expectation) {
   check('应用后状态为 applied', patched.applied)
 
   // ---- 功能断言：补丁后的 isReplaceOp 真能接受/拒绝预期形状 ----
-  const isReplaceOp = loadIsReplaceOp(fs.readFileSync(sessionPath, 'utf8'))
+  const { isReplaceOp, surfaceOpOf } = loadSurfaceOpHelpers(fs.readFileSync(sessionPath, 'utf8'))
   const canonical = expectation.generation === GEN_SEQ ? { start: 'startSeq', end: 'endSeq' } : { start: 'start', end: 'end' }
   const foreign = expectation.generation === GEN_SEQ ? { start: 'start', end: 'end' } : { start: 'startSeq', end: 'endSeq' }
 
-  const caseCanonical = { op: 'replace', [canonical.start]: 3, [canonical.end]: 9 }
-  check('接受本代规范 op', isReplaceOp(caseCanonical) === true)
+  // 核心写入前会 deepFreeze 事件，surfaceOp 是冻结对象：全部用例都按冻结对象测
+  const caseCanonical = Object.freeze({ op: 'replace', [canonical.start]: 3, [canonical.end]: 9 })
+  check('接受本代规范 op（冻结对象）', isReplaceOp(caseCanonical) === true)
 
-  const caseImpact = { op: 'replace', [canonical.start]: 3, [canonical.end]: 9, impact: 'clear' }
-  check('接受带 impact:"clear" 的 4 键 op', isReplaceOp(caseImpact) === true)
+  const caseImpact = Object.freeze({ op: 'replace', [canonical.start]: 3, [canonical.end]: 9, impact: 'clear' })
+  // 浏览器端 wire 校验（dsh-api-session-controller 的 assertSessionWireEvent）要求恰好 3 个键，
+  // 第 4 个键会让 follow 流整块报 “invalid replace surfaceOp”，所以宿主必须拒绝它
+  check('拒绝带 impact 的 4 键 op（客户端只接受 3 键）', isReplaceOp(caseImpact) === false)
 
-  const caseForeign = { op: 'replace', [foreign.start]: 3, [foreign.end]: 9 }
+  const caseForeign = Object.freeze({ op: 'replace', [foreign.start]: 3, [foreign.end]: 9 })
   const foreignAccepted = isReplaceOp(caseForeign) === true
-  check('接受另一代键拼写（历史日志重放）', foreignAccepted)
-  if (foreignAccepted) {
-    check('跨代拼写被就地归一化',
-      caseForeign[canonical.start] === 3 && caseForeign[canonical.end] === 9 && caseForeign[foreign.start] === undefined,
-      JSON.stringify(caseForeign))
-  }
+  check('接受另一代键拼写（历史日志重放，冻结对象不抛错）', foreignAccepted)
+  check('不改写调用方对象',
+    Object.keys(caseForeign).join(',') === ['op', foreign.start, foreign.end].join(','),
+    Object.keys(caseForeign).join(','))
 
-  const caseForeignImpact = { op: 'replace', [foreign.start]: 3, [foreign.end]: 9, impact: 'clear' }
-  check('接受另一代拼写 + impact（旧补丁写入的日志）', isReplaceOp(caseForeignImpact) === true)
+  // 跨代拼写由 surfaceOpOf 解析成本代键名后交给 fold（不能就地改冻结对象）
+  const normalized = surfaceOpOf({ type: 'tool/result', surfaceOp: caseForeign })
+  check('surfaceOpOf 把另一代拼写解析成本代键名',
+    normalized[canonical.start] === 3 && normalized[canonical.end] === 9 && normalized[foreign.start] === undefined,
+    JSON.stringify(normalized))
+  // v3 及更早的补丁把 impact 放在 surfaceOp 上；v4 起标记改放事件 data，op 上出现 impact 必须被拒绝
+  let impactRejected = false
+  try {
+    surfaceOpOf({
+      type: 'tool/result',
+      surfaceOp: Object.freeze({ op: 'replace', [canonical.start]: 3, [canonical.end]: 9, impact: 'clear' }),
+    })
+  } catch {
+    impactRejected = true
+  }
+  check('surfaceOpOf 拒绝带 impact 的 op（失败即拒绝该次清除，不影响会话）', impactRejected)
+  check('本代拼写原样返回（不额外复制）', surfaceOpOf({ type: 'tool/result', surfaceOp: caseCanonical }) === caseCanonical)
+
+  // 「清除型」判定必须来自内容比对：事件上既不能多 surfaceOp 键，也不能多 data 字段
+  const sessionSource = fs.readFileSync(sessionPath, 'utf8')
+  check('新增内容比对判定函数', sessionSource.includes('function clearsToolResultContent(event, shadowedSeqs, events, baseSeq)'))
+  check('plan 层用内容比对结果作为 impact',
+    sessionSource.includes('const impact = clearsToolResultContent(event, range.shadowedSeqs, events, baseSeq) ? "clear" : undefined;'))
+  check('plan 层不再从 surfaceOp 读取 impact', sessionSource.includes('impact: surfaceOp.impact') === false)
 
   check('拒绝 5 键 op', isReplaceOp({ op: 'replace', [canonical.start]: 3, [canonical.end]: 9, impact: 'clear', extra: 1 }) === false)
   check('拒绝非法 impact 值', isReplaceOp({ op: 'replace', [canonical.start]: 3, [canonical.end]: 9, impact: 'other' }) === false)
@@ -150,13 +185,37 @@ function exerciseUpgrade(label, sourceRoot) {
   check('可就地升级而非报错', result.changed)
   check('升级被标记', result.upgraded === true)
   check('升级后状态为 applied', patchStatus(treeRoot).applied)
-  const isReplaceOp = loadIsReplaceOp(fs.readFileSync(sessionPath, 'utf8'))
+  const { isReplaceOp } = loadSurfaceOpHelpers(fs.readFileSync(sessionPath, 'utf8'))
   const gen = coreGeneration(treeRoot)
   const canonical = gen === GEN_SEQ ? { start: 'startSeq', end: 'endSeq' } : { start: 'start', end: 'end' }
   const foreign = gen === GEN_SEQ ? { start: 'start', end: 'end' } : { start: 'startSeq', end: 'endSeq' }
-  check('升级后接受跨代拼写', isReplaceOp({ op: 'replace', [foreign.start]: 1, [foreign.end]: 2 }) === true)
-  check('升级后仍接受规范 op', isReplaceOp({ op: 'replace', [canonical.start]: 1, [canonical.end]: 2, impact: 'clear' }) === true)
+  check('升级后接受跨代拼写（冻结对象）', isReplaceOp(Object.freeze({ op: 'replace', [foreign.start]: 1, [foreign.end]: 2 })) === true)
+  check('升级后仍接受规范 op', isReplaceOp(Object.freeze({ op: 'replace', [canonical.start]: 1, [canonical.end]: 2 })) === true)
+  check('升级后拒绝旧版 4 键 op', isReplaceOp(Object.freeze({ op: 'replace', [canonical.start]: 1, [canonical.end]: 2, impact: 'clear' })) === false)
   check('升级后 session 内容已变化', fs.readFileSync(sessionPath, 'utf8') !== before)
+}
+
+/**
+ * 合成「已装 v2 补丁（>=0.1.5 就地归一化版）」的核心树：
+ * 先打到本次补丁态，再把 replace-op-shape 退回 v2 文本、surfaceOpOf 退回原始文本。
+ * 这是真实升级路径的回归夹具（v2 在冻结的 op 上写 startSeq，会抛 TypeError）。
+ */
+function makeV2Fixture(label, pristineSource) {
+  const root = assembleTree(label, pristineSource)
+  const sessionPath = path.join(root, SESSION_REL)
+  const pristineSurfaceOpOf = extractFunctionText(fs.readFileSync(sessionPath, 'utf8'), 'function surfaceOpOf(')
+  applyPatches(root)
+  let text = fs.readFileSync(sessionPath, 'utf8')
+  text = text.replace(
+    extractFunctionText(text, 'function isReplaceOp('),
+    `function isReplaceOp(value) {\n\tconst op = value;\n${V2_SEQ_REPLACE_OP_SHAPE}\n}`,
+  )
+  text = text.replace(extractFunctionText(text, 'function surfaceOpOf('), pristineSurfaceOpOf)
+  fs.writeFileSync(sessionPath, text)
+  const status = patchStatus(root)
+  check(`${label}：夹具处于「可升级」态`, status.upgradable && !status.applied,
+    status.files.flatMap((file) => file.edits.map((edit) => `${edit.id}=${edit.state}`)).join(', '))
+  return root
 }
 
 const FIXTURES = {
@@ -196,7 +255,10 @@ for (const version of packs) {
       }
     }
     const assembled = assembleTree(`pack-${version}`, source)
-    exercise(`npm:${version}`, assembled, FIXTURES[coreGeneration(assembled) ?? GEN_LEGACY])
+    const generation = coreGeneration(assembled) ?? GEN_LEGACY
+    exercise(`npm:${version}`, assembled, FIXTURES[generation])
+    // >=0.1.5 还要验证：已装 v2 补丁（就地归一化版）的核心能就地升级到只解析不改写的版本
+    if (generation === GEN_SEQ) exerciseUpgrade(`npm:${version} + v2 补丁态`, makeV2Fixture(`v2-${version}`, source))
   } catch (error) {
     console.log(`跳过 ${version}：${error instanceof Error ? error.message.split('\n')[0] : String(error)}`)
   }
