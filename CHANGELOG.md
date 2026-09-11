@@ -2,6 +2,15 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。此处只记录版本之间的行为差异。
 
+## [未发布]
+
+### Fixed
+- `read_tool_result_log` 的字符串编号在 0.6.7 上**没有生效**：实测 `turn: "13"`
+  返回的是"归档轮次列表"而不是该轮内容。原因在参数进入插件之前 —— `input schema` 把
+  `turn`/`step` 声明为 `integer`，类型不符的参数会被过滤掉，插件根本收不到。
+  现在 schema 放宽为 `['integer', 'string']`，同时 `execute` 改为复制参数后归一化
+  （core 可能传冻结对象，直接赋值会被静默忽略）。
+
 ## [0.6.7] - 2026-09-12
 
 ### Fixed

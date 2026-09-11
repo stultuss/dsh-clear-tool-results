@@ -31,6 +31,16 @@ function eventRef(event) {
   }
 }
 
+/** 取回工具的参数归一化：只把纯数字字符串的 turn/step 变成数字，其余原样透传。 */
+function normalizeReadArgs(input) {
+  const args = { ...(input ?? {}) }
+  for (const key of ['turn', 'step']) {
+    const raw = args[key]
+    if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) args[key] = Number(raw.trim())
+  }
+  return args
+}
+
 export const name = 'dsh-clear-tool-results'
 export const inject = ['commands', 'tools', 'sessionPersistence']
 
@@ -906,11 +916,11 @@ function readToolResultLogTool(ctx) {
       additionalProperties: false,
       properties: {
         turn: {
-          type: 'integer',
+          type: ['integer', 'string'],
           description: '对话轮次编号（1 起），如 turn: 3 读取第 3 轮。用户指明轮次时优先使用。',
         },
         step: {
-          type: 'integer',
+          type: ['integer', 'string'],
           description: '步骤编号（1 起，一次模型决策即一步），需配合 turn 使用，如 turn: 3, step: 2 读取第 3 轮第 2 步。占位符注明 turn/step 时优先按此精确读取。',
         },
         time: {
@@ -940,21 +950,9 @@ function readToolResultLogTool(ctx) {
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    async execute(args, exec) {
-    // 0.6.7：把 "3" 这类字符串编号归一化成数字。此前 typeof 判断会因类型不符
-    // 直接落到"列出归档轮次"分支，模型看到的是"取回为空"，却没有任何报错。
-    if (args && typeof args === 'object') {
-      for (const key of ['turn', 'step']) {
-        const raw = args[key]
-        if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
-          try {
-            args[key] = Number(raw.trim())
-          } catch {
-            // 参数被冻结时保持原样
-          }
-        }
-      }
-    }
+    async execute(rawArgs, exec) {
+    // 0.6.7：core 传进来的参数可能是冻结对象，直接赋值会被静默忽略 —— 复制一份再归一化。
+    const args = normalizeReadArgs(rawArgs)
       const session = exec.agent?.session
       if (!session) return { error: '无可用会话上下文' }
       const logsDir = logsDirOf(ctx, session)
