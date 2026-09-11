@@ -46,15 +46,17 @@ dsh plugin --profile web add dsh-clear-tool-results
 | `/clear-tool-results on` | 普通模式：每轮归档 + 轮末清除（自动回退核心补丁） |
 | `/clear-tool-results overclock` | 激进模式：每步即时归档 + 滞后一步清除（自动应用核心补丁） |
 | `/clear-tool-results off` | 停用：保留工具结果、不再归档（自动回退核心补丁） |
-| `/clear-tool-results status` | 显示启用状态、模式、插件版本与补丁状态 |
+| `/clear-tool-results status` | 显示启用状态、模式、插件版本、补丁状态与会话归因汇总 |
 
 建议在轮次之间切换模式；轮中途切换只对之后的步骤生效，已清除的结果保持占位符（原文仍可在归档中读取）。
 
 ## 功能
 
 - **归档**：从追加式会话日志（而非改写后的 surface）取出原始 `tool/result`，保留轮次/步骤号、工具名与匹配的 `tool/call`。round 每轮写 `round-NNNN.json`，overclock 每个 `step/end` 写 `round-NNNN-step-MMM.json`，两者都登记进 `index.json`；以 index 为准、幂等，可补归档中途启用或重启前的轮次。
-- **清除**：round 在 `turn/end` 写入 `[第 3 轮工具结果已清除归档，可用 read_tool_result_log(turn: 3) 读取]`；overclock 在 `step/end` 清除上一步并在占位符注明步骤，`turn/end` 兜底清除最后一步。
+- **清除**：round 在 `turn/end` 写入 `[第 3 轮工具结果已清除归档：bash → git status（1.2k 字符），可用 read_tool_result_log(turn: 3) 读取]`；overclock 在 `step/end` 清除上一步并在占位符注明步骤，`turn/end` 兜底清除最后一步。
+- **占位符索引**：占位符带一步索引——工具名 → 关键参数（命令/路径/模式，前 40 字）+ 规模 + 是否失败；同一步多条合并成一行。让模型先知道「里面有什么」，再决定要不要取回。
 - **取回引导**：overclock 下每轮第一条清除占位符附带「可见性规则」（取回内容同样只存活一步，需精确原文时在使用的上一步再取），其余占位符保持短文本；`read_tool_result_log` 成功返回时附 `note` 提示。
+- **归因埋点**：`usage.mjs` 只观测不改行为——每条被清除结果的「可辨识记号」（含数字/路径）此后首次出现在哪里，就归入 `read` / `rerun` / `carryText` / `carryReasoning` / `reuseArgs` 之一，每轮末写 `<logsDir>/usage.json`，`status` 显示一行汇总。用来判断「引导取回」值不值得做。
 - **开关与状态**：`{ enabled, mode }` 存于 `$DSH_HOME/clear-tool-results.json`（默认启用 + round；旧状态文件按 round 兼容）。
 - **依赖**：仅 Node 内置模块；适用于所有会话与 agent preset；与 DSH 内置 compaction 兼容。
 

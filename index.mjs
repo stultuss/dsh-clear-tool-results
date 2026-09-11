@@ -16,6 +16,7 @@ import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises'
 import { appendFileSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import * as usage from './usage.mjs'
 
 export const name = 'dsh-clear-tool-results'
 export const inject = ['commands', 'tools', 'sessionPersistence']
@@ -180,10 +181,13 @@ export function apply(ctx) {
       if (arg === 'status') {
         const state = await readState()
         const modeText = MODE_LABEL[state.mode] ?? MODE_LABEL[MODE_ROUND]
+        const usageLine = agent?.session ? usage.summaryText(agent.session.id) : null
         const text = state.enabled
           ? `当前状态：已启用（${modeText}）`
           : `当前状态：已禁用（上次模式：${modeText}）`
-        return { kind: 'success', text: text + (await corePatchStatusLine()) + `\n插件版本：${PLUGIN_VERSION}` }
+        const lines = [text + (await corePatchStatusLine()), `插件版本：${PLUGIN_VERSION}`]
+        if (usageLine) lines.push(usageLine)
+        return { kind: 'success', text: lines.join('\n') }
       }
       return { kind: 'error', text: '用法：/clear-tool-results on|off|status|overclock' }
     },
@@ -205,6 +209,29 @@ export function apply(ctx) {
       queueMicrotask(() => {
         onStepEnd(ctx, session, turn, step).catch((error) => warn(ctx, String(error)))
       })
+    } else if (event.type === 'assistant/message') {
+      // 归因埋点（只观测，见 usage.mjs）：结果被清除后，具体事实是否被转述进推理/可见文本
+      try {
+        let text = ''
+        let reasoning = ''
+        for (const part of event.data?.message?.content ?? []) {
+          if (!part) continue
+          if (part.type === 'reasoning' || part.type === 'thinking') reasoning += String(part.text ?? '')
+          else if (typeof part === 'string') text += part
+          else if (part.text) text += String(part.text)
+        }
+        usage.attributeText(session.id, text, 'carryText')
+        usage.attributeText(session.id, reasoning, 'carryReasoning')
+      } catch (error) {
+        warn(ctx, '归因埋点失败 ' + String(error))
+      }
+    } else if (event.type === 'tool/call') {
+      // 归因埋点（只观测）：同参重跑 -> rerun；用上早先结果里的具体值 -> reuseArgs
+      try {
+        usage.attributeCall(session.id, event.data?.name, usage.argsText(event.data?.arguments))
+      } catch (error) {
+        warn(ctx, '归因埋点失败 ' + String(error))
+      }
     }
   }))
   disposers.push(ctx.tools.register(readToolResultLogTool(ctx)))
@@ -226,6 +253,8 @@ async function onTurnEnd(ctx, session, endedTurn) {
       if (typeof endedTurn === 'number') await archiveUnarchived(session, endedTurn - 1, logsDir)
       // 刷新刚结束的轮次，保证归档完整
       if (typeof endedTurn === 'number') await archiveTurn(session, endedTurn, logsDir, true)
+      // 归因埋点落盘（0.6.3）：本轮被清除的结果后来从哪条路被"再用"
+      await usage.persist(session.id, logsDir)
     })
   } catch (error) {
     // 归档失败不能连带跳过清除：否则工具结果会一直留在上下文里（0.1.5 上曾整轮不生效）
@@ -378,8 +407,12 @@ function clearToolResultsWhere(session, matches) {
     }
     // 逐条独立：某一条目标已不在 surface（被别的 replace/压缩遮蔽）时只跳过这一条，
     // 不影响本次其余清除，也不把异常抛给调用方（逐步清除后仍要归档、轮末仍要收尾）。
+    // 索引行与归因埋点都在这里取一次原文（0.6.3）：占位符带上"这一步里是什么"，
+    // 之后模型是否转述/重用由 usage.mjs 判断。
+    const info = describeClearedResult(session, data)
     try {
-      replaceToolResult(session, seq, data, clearedText(turn, step, extended))
+      replaceToolResult(session, seq, data, clearedText(turn, step, extended, info.index, usage.takeHint(session.id)))
+      usage.recordCleared(session.id, { turn, step, tool: info.tool, callKey: info.callKey, text: info.text })
       cleared += 1
     } catch (error) {
       warn(null, `清除失败（目标 seq ${seq} 已不在 surface 或写入被拒）：${String(error?.message ?? error)}`)
@@ -458,19 +491,130 @@ function placeholderTextOf(message) {
   return inner?.text ?? ''
 }
 
-function clearedText(turn, step, extended) {
+/** 占位符索引 + 归因埋点共用：callId -> tool/call 事件。 */
+function indexToolCalls(events) {
+  const map = new Map()
+  for (const event of events) {
+    if (event?.type !== 'tool/call') continue
+    const callId = event.data?.callId
+    if (callId) map.set(callId, event.data)
+  }
+  return map
+}
+
+function callOfResult(data, callByCallId) {
+  const callId = data?.message?.source?.callId ?? data?.source?.callId ?? data?.callId
+  return callId ? callByCallId.get(callId) : undefined
+}
+
+function toolNameOfResult(call, data) {
+  return call?.name ?? data?.message?.source?.toolName ?? data?.toolName ?? 'tool'
+}
+
+/** 关键参数一行摘要：命令/路径/查询优先，压成单行后前 40 字。 */
+function callHintOf(call) {
+  const raw = call?.arguments
+  let args = raw
+  if (typeof raw === 'string') {
+    try {
+      args = JSON.parse(raw)
+    } catch {
+      args = raw
+    }
+  }
+  if (typeof args === 'string') return squashLine(args).slice(0, 40)
+  if (args && typeof args === 'object') {
+    for (const field of ['command', 'file_path', 'path', 'pattern', 'query', 'url', 'code', 'prompt']) {
+      const value = args[field]
+      if (typeof value === 'string' && value.trim() !== '') return squashLine(value).slice(0, 40)
+    }
+    try {
+      return squashLine(JSON.stringify(args)).slice(0, 40)
+    } catch {
+      return ''
+    }
+  }
+  return ''
+}
+
+function squashLine(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim()
+}
+
+/** 结果消息里的纯文本（埋点记号与规模统计用）。 */
+function resultTextOf(message) {
+  const parts = []
+  const walk = (value) => {
+    if (!value) return
+    if (typeof value === 'string') {
+      parts.push(value)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item)
+      return
+    }
+    if (typeof value === 'object') {
+      if (typeof value.text === 'string') parts.push(value.text)
+      if (Array.isArray(value.content)) walk(value.content)
+    }
+  }
+  walk(message?.content)
+  return parts.join('\n')
+}
+
+/** 这条结果是不是失败（错误标记或非零退出码）。 */
+function resultFailed(data) {
+  if (data?.message?.isError === true) return true
+  const text = resultTextOf(data?.message)
+  return /(^|\n)\s*(exit code|退出码)\s*[:：]?\s*[1-9]/.test(text)
+}
+
+/** 一条被清除结果的索引信息：同一步的多条结果合并成一行，供占位符使用。 */
+function describeClearedResult(session, data) {
+  try {
+    const events = eventsOf(session)
+    const calls = indexToolCalls(events)
+    const call = callOfResult(data, calls)
+    const tool = toolNameOfResult(call, data)
+    const siblings = []
+    for (const event of events) {
+      if (event?.type !== TOOL_RESULT || event.surfaceOp !== 'append') continue
+      if (event.data?.turn !== data?.turn || event.data?.step !== data?.step) continue
+      const siblingCall = callOfResult(event.data, calls)
+      siblings.push({
+        tool: toolNameOfResult(siblingCall, event.data),
+        hint: callHintOf(siblingCall),
+        chars: resultTextOf(event.data?.message).length,
+        failed: resultFailed(event.data),
+      })
+    }
+    return {
+      tool,
+      text: resultTextOf(data?.message),
+      callKey: usage.callKeyOf(tool, usage.argsText(call?.arguments)),
+      index: usage.indexText(siblings),
+    }
+  } catch {
+    return { tool: 'tool', text: '', callKey: null, index: '' }
+  }
+}
+
+function clearedText(turn, step, extended, index, hint) {
+  const indexPart = index ? `：${index}` : ''
+  const hintPart = hint ? `（提示：${hint}）` : ''
   const core =
     typeof turn === 'number' && typeof step === 'number'
-      ? `[第 ${turn} 轮 第 ${step} 步工具结果已清除归档，可用 read_tool_result_log(turn: ${turn}, step: ${step}) 读取]`
+      ? `[第 ${turn} 轮 第 ${step} 步工具结果已清除归档${indexPart}，可用 read_tool_result_log(turn: ${turn}, step: ${step}) 读取]`
       : typeof turn === 'number'
-        ? `[第 ${turn} 轮工具结果已清除归档，可用 read_tool_result_log(turn: ${turn}) 读取]`
-        : '[工具结果已清除归档，可用 read_tool_result_log 读取]'
-  if (!extended || typeof turn !== 'number') return core
+        ? `[第 ${turn} 轮工具结果已清除归档${indexPart}，可用 read_tool_result_log(turn: ${turn}) 读取]`
+        : `[工具结果已清除归档${indexPart}，可用 read_tool_result_log 读取]`
+  if (!extended || typeof turn !== 'number') return core + hintPart
   const stepPart =
     typeof step === 'number'
       ? `；确实需要精确原文时，请恰好在使用它的那一步之前用 read_tool_result_log(turn: ${turn}, step: ${step}) 取回`
       : ''
-  return `[第 ${turn} 轮工具结果已清除归档。可见性规则（overclock）：某一步的工具结果仅在紧随其后的下一步决策中可见，取回内容同样如此${stepPart}；若总结需引用多步内容，可在总结前用 read_tool_result_log(turn: ${turn}) 整轮取回一次。]`
+  return `[第 ${turn} 轮工具结果已清除归档${indexPart}。可见性规则（overclock）：某一步的工具结果仅在紧随其后的下一步决策中可见，取回内容同样如此${stepPart}；若总结需引用多步内容，可在总结前用 read_tool_result_log(turn: ${turn}) 整轮取回一次。]` + hintPart
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +874,12 @@ function readToolResultLogTool(ctx) {
       ) {
         result.note =
           '取回提示（overclock）：归档内容同样只在紧随其后的下一步决策中可见，请立即使用；若总结需引用多步原文，建议总结前按轮整轮取回一次。'
+        // 归因埋点（只观测）：这次取回命中了哪些轮/步，用来统计"取回"渠道的真实占比
+        try {
+          usage.markRead(session.id, { turn: result.turn, step: result.step, time: result.timeFrom })
+        } catch {
+          // 忽略
+        }
       }
       return result
     },
