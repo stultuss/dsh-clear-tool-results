@@ -15,15 +15,46 @@ Chat 界面为每个系列渲染一次系统提示词 —— 结果就是每步�
 
 **双代数**——保留旧计数，新增一个"只对非清除型 replace 递增"的计数：
 
-| 文件 | 改动 |
-| --- | --- |
-| `dsh-session/lib/index.js` | ① `createFoldState()` 增加 `seriesGeneration: 0`；② `isReplaceOp` 放行第 4 个键 `impact:"clear"`；③ `planSurfaceEvent` 把 `impact` 透传进 plan；④ `applySurfacePlan` 的 replace 分支：`replaceGeneration += 1` 照旧，仅当 `plan.impact !== "clear"` 时 `seriesGeneration += 1`；⑤ surface 暴露 `seriesGeneration` getter |
-| `dsh-agent-loop/lib/index.js` | 系列判定改读 `this.session.surface.seriesGeneration ?? this.session.surface.replaceGeneration` |
+| 位点 | `<= 0.1.4`（legacy） | `>= 0.1.5`（seq） |
+| --- | --- | --- |
+| `session:fold-state` | `createFoldState()` 增加 `seriesGeneration: 0` | 文本未变，共用 |
+| `session:replace-op-shape` | `isReplaceOp` 放行第 4 个键 `impact:"clear"` | 核心改用 `startSeq/endSeq` + `Object.hasOwn`/`isEventSeq` 校验，需独立锚点 |
+| `session:plan-passthrough` | `planSurfaceEvent` 把 `impact` 透传进 plan | 键名变为 `startSeq/endSeq`，需独立锚点 |
+| `session:series-counter` | `applySurfacePlan` 的 replace 分支：`replaceGeneration += 1` 照旧，仅当 `plan.impact !== "clear"` 时 `seriesGeneration += 1` | 文本未变，共用 |
+| `session:series-getter` | surface 暴露 `seriesGeneration` getter | 文本未变，共用 |
+| `agent-loop:series-generation` | 单处：局部量 `const surfaceGeneration = …seriesGeneration ?? …replaceGeneration`（比较与重捕获都走它） | 三处：构造期捕获 + 系统提示投影比较 + buildRequest 局部量（新增 `startsRequestSeries` / `toolsChanged(...)` 输入） |
 
 `replaceGeneration` 语义完全不变，因此所有既有消费者（模型上下文的投影缓存、压缩轮询、
 客户端镜像计数）行为不变；只有「新系列」的判定不再被工具结果清除触发。
 
 agent-loop 侧带 `??` 回退，所以两个文件可以分别应用/回退，任一侧未打补丁都退回原行为。
+
+## 版本兼容矩阵
+
+| 核心代数 | 版本 | surface op 键名 | agent-loop 系列判定 | 补丁状态 |
+| --- | --- | --- | --- | --- |
+| `legacy` | `<= 0.1.4` | `start` / `end` | 单处局部量 | 6 位点全部可用 |
+| `seq` | `>= 0.1.5`（0.1.5-rc.1 / rc.2 已实测） | `startSeq` / `endSeq` | 三处 | 3 个位点走 seq 变体，其余共用 |
+
+识别代数用的是 `isReplaceOp` 的校验表达式（打补丁前后都稳定），**不解析版本号**：
+alpha / rc 的版本排序不可靠，而代码谱系是确定的。
+
+* 每个位点登记多个「变体」，apply 时挑选当前文件里唯一匹配的那一个；任一位点无变体匹配
+  → 整体拒绝写入（先全量校验、后落盘），不会留下半补丁状态。
+* **跨代拼写兼容**：补丁后的 `isReplaceOp` 同时接受 `start/end` 与 `startSeq/endSeq` 两种拼写，
+  并就地归一化到本代规范拼写 —— 于是旧核心写入的历史会话日志能在新核心上折叠重放（反向亦然）。
+* **历史补丁态可升级**：v1 补丁写出的文本也登记在 `from` 列表里，装过 v1 的核心执行 `apply`
+  会就地升级到 v2，`revert` 仍回到原始文件。
+* 插件运行时按代数选择 op 键名；若判断有误，首次写入被核心拒绝后会换另一代拼写重试一次并记住
+  （核心的 `surfaceOp` 校验先于写入，失败尝试不会污染会话日志）。
+
+验证套件（对每个代数跑「原始 → 应用 → 功能断言 → 回退」闭环）：
+
+```bash
+npm run check:compat        # 从 npm 拉取各版本核心（需要网络）
+node patches/check-harness-compat.mjs --tree legacy=/path/to/0.1.2 --tree seq=/path/to/0.1.5
+node patches/check-harness-compat.mjs --v1-tree /usr/local/lib/node_modules/@deepseek-ai/dsh   # 额外验证 v1 → v2 就地升级
+```
 
 ## 插件侧的配合
 
@@ -48,6 +79,7 @@ agent-loop 侧带 `??` 回退，所以两个文件可以分别应用/回退，�
 也可以手动执行：
 
 ```bash
+cd ~/.dsh/profiles/web/node_modules/dsh-clear-tool-results
 npm run patch:status   # 查看状态
 npm run patch:apply    # 应用（自动备份到 ~/.dsh/clear-tool-results-backups/）
 npm run patch:revert   # 回退
@@ -60,4 +92,7 @@ node patches/patch-core.mjs apply --root /path/to/@deepseek-ai/dsh
 * 应用前会校验每个位点的目标文本恰好出现一次；核心版本升级导致文本变化时会拒绝应用并提示，
   不会写入半成品。
 * 原始文件备份在 `~/.dsh/clear-tool-results-backups/`（首次应用时创建），`revert` 优先从备份恢复。
-* 核心包升级/重装后补丁会被覆盖，重新执行 `npm run patch:apply` 即可。
+  备份带代数元数据（同名 `.json` 边车）：核心升级/降级到另一代后，异代备份**不会被**误用于还原，
+  此时自动改用反向替换并在输出里提示。
+* 核心包升级/重装后补丁会被覆盖，重新执行 `npm run patch:apply` 即可；换成另一代核心
+  （如 0.1.2 → 0.1.5）时 `apply` 会自动挑对应变体，`status` 会显示识别到的代数。
