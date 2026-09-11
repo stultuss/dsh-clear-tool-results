@@ -232,6 +232,14 @@ export function apply(ctx) {
       } catch (error) {
         warn(ctx, '归因埋点失败 ' + String(error))
       }
+    } else if (event.type === 'tool/ptc-dispatch') {
+      // 归因埋点 + 索引行（只观测）：run_code 内部的子调用。0.6.4 实测事件流里拿不到它们，
+      // 所以在这里自己收一份，占位符索引才能显示真实动作（bash → git status）
+      try {
+        usage.recordPtcDispatch(session.id, event.data)
+      } catch (error) {
+        warn(ctx, '归因埋点失败 ' + String(error))
+      }
     }
   }))
   disposers.push(ctx.tools.register(readToolResultLogTool(ctx)))
@@ -585,6 +593,32 @@ function ptcItemsOf(events, turn, step) {
   return items
 }
 
+/** 从一段对象字面量文本里抽第一个字符串字段（命令/路径优先）。 */
+function stringFieldOf(body) {
+  const match = body.match(/(command|file_path|path|pattern|query|description)\s*:\s*([^,\n]{1,80})/)
+  if (!match) return null
+  return squashLine(match[2].replace(/^[^A-Za-z0-9/._-]+|[^A-Za-z0-9/._-]+$/g, '')).slice(0, 40)
+}
+
+/** run_code 代码里直接写着的子调用（tools.bash({ command: '…' })）：事件流里看不到 PTC 子调用时的兜底。 */
+function innerCallsOf(call) {
+  try {
+    const raw = call?.arguments
+    const args = typeof raw === 'string' ? JSON.parse(raw) : raw
+    const code = args?.code
+    if (typeof code !== 'string') return []
+    const items = []
+    const re = /tools\.([a-z_]+)\s*\(\s*\{([\s\S]{0,240}?)\}\s*\)/g
+    let match
+    while ((match = re.exec(code)) !== null && items.length < 3) {
+      items.push({ tool: match[1], hint: stringFieldOf(match[2]) ?? squashLine(match[2]).slice(0, 40), chars: 0, failed: false })
+    }
+    return items
+  } catch {
+    return []
+  }
+}
+
 /** 一条被清除结果的索引信息：同一步的多条结果合并成一行，供占位符使用。 */
 function describeClearedResult(session, data) {
   try {
@@ -604,18 +638,20 @@ function describeClearedResult(session, data) {
         failed: resultFailed(event.data),
       })
     }
-    // PTC 模式下真正干活的是 run_code 里的子调用：索引行优先显示它们，
-    // 否则只会显示 run_code 的代码前缀（截断后是一段看不懂的碎片）
-    const dispatches = ptcItemsOf(events, data?.turn, data?.step)
-    if (dispatches.length > 0 && siblings.length > 0) {
-      dispatches[0].chars = siblings[0].chars
-      dispatches[0].failed = siblings[0].failed
+    // PTC 模式下真正干活的是 run_code 里的子调用：索引行优先显示它们。
+    // 三个来源依次尝试：hook 收下的子调用 -> 事件流里的子调用 -> 直接解析 run_code 的代码
+    let items = usage.ptcItems(session.id, data?.turn, data?.step)
+    if (items.length === 0) items = ptcItemsOf(events, data?.turn, data?.step)
+    if (items.length === 0) items = innerCallsOf(call)
+    if (items.length > 0 && siblings.length > 0) {
+      items[0].chars = siblings[0].chars
+      items[0].failed = siblings[0].failed
     }
     return {
       tool,
       text: resultTextOf(data?.message),
       callKey: usage.callKeyOf(tool, usage.argsText(call?.arguments)),
-      index: usage.indexText(dispatches.length > 0 ? dispatches : siblings),
+      index: usage.indexText(items.length > 0 ? items : siblings),
     }
   } catch {
     return { tool: 'tool', text: '', callKey: null, index: '' }

@@ -13,6 +13,8 @@ import { join } from 'node:path'
 //   carryText       转述进助手可见文本
 //   carryReasoning  转述进推理
 //   reuseArgs       具体值被复用到新的工具入参
+//   common          只被样板记号命中过（工作区路径 / index.mjs 这类到处都有的词）——不算复用证据，
+//                   条目会留着等稀有记号，所以它和上面的渠道可能同时出现（诊断用）
 //   none            之后再也没有被用过
 //
 // 用途：先在真实会话里看清四个渠道的比率，再决定要不要投入"引导取回"的改动。
@@ -22,6 +24,7 @@ const TOKEN_RE = /[A-Za-z0-9_./@:-]{6,}/g
 const MAX_TOKENS = 96
 const MAX_ENTRIES = 120
 const MAX_HINTS = 4
+const PTC_MAX_KEYS = 200
 const USAGE_FILE = 'usage.json'
 const CHANNELS = ['read', 'rerun', 'carryText', 'carryReasoning', 'reuseArgs']
 
@@ -56,10 +59,73 @@ export function callKeyOf(toolName, argsString) {
 function bookOf(sessionId) {
   let book = books.get(sessionId)
   if (!book) {
-    book = { sessionId, entries: [], hints: [], stats: { cleared: 0 }, startedAt: Date.now() }
+    book = { sessionId, entries: [], hints: [], ptc: new Map(), df: new Map(), stats: { cleared: 0 }, startedAt: Date.now() }
     books.set(sessionId, book)
   }
   return book
+}
+
+function rebuildDf(book) {
+  book.df = new Map()
+  for (const entry of book.entries) {
+    for (const token of entry.tokens) book.df.set(token, (book.df.get(token) || 0) + 1)
+  }
+}
+
+/** 稀有记号：在已登记结果里出现 <=30% 的记号。样板词（工作区路径、index.mjs、run_code…）不算。 */
+function isRare(book, token) {
+  const limit = Math.max(1, Math.floor(book.entries.length * 0.3))
+  return (book.df.get(token) || 0) <= limit
+}
+
+/** 从工具入参里抽一行关键参数（命令/路径/模式优先），供占位符索引使用。 */
+function hintOfArgs(args) {
+  let value = args
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value)
+    } catch {
+      return String(args).replace(/\s+/g, ' ').trim().slice(0, 40)
+    }
+  }
+  if (value && typeof value === 'object') {
+    for (const field of ['command', 'file_path', 'path', 'pattern', 'query', 'description', 'prompt']) {
+      const raw = value[field]
+      if (typeof raw === 'string' && raw.trim() !== '') return raw.replace(/\s+/g, ' ').trim().slice(0, 40)
+    }
+  }
+  return ''
+}
+
+/** PTC 子调用登记：run_code 内部真正的 bash/read/…（事件流里看不到，所以在 hook 里自己收）。 */
+export function recordPtcDispatch(sessionId, data) {
+  try {
+    const turn = data && data.turn
+    const step = data && data.step
+    if (typeof turn !== 'number' || typeof step !== 'number') return
+    const book = bookOf(sessionId)
+    const key = turn + ':' + step
+    const list = book.ptc.get(key) || []
+    list.push({ tool: (data && data.name) || 'tool', hint: hintOfArgs(data && data.arguments), chars: 0, failed: false })
+    if (list.length > 8) list.splice(0, list.length - 8)
+    book.ptc.delete(key)
+    book.ptc.set(key, list)
+    while (book.ptc.size > PTC_MAX_KEYS) book.ptc.delete(book.ptc.keys().next().value)
+  } catch {
+    // 忽略
+  }
+}
+
+/** 取某一步登记过的 PTC 子调用（没有则空数组）。 */
+export function ptcItems(sessionId, turn, step) {
+  try {
+    const book = books.get(sessionId)
+    if (!book || typeof turn !== 'number' || typeof step !== 'number') return []
+    const list = book.ptc.get(turn + ':' + step)
+    return list ? list.map((item) => Object.assign({}, item)) : []
+  } catch {
+    return []
+  }
 }
 
 /** 登记一条刚被清除的结果：原文只在这里读一次，之后靠记号判断是否被转述/复用。 */
@@ -77,7 +143,12 @@ export function recordCleared(sessionId, info) {
       hit: null,
       at: Date.now(),
     })
-    if (book.entries.length > MAX_ENTRIES) book.entries.splice(0, book.entries.length - MAX_ENTRIES)
+    const entry = book.entries[book.entries.length - 1]
+    for (const token of entry.tokens) book.df.set(token, (book.df.get(token) || 0) + 1)
+    if (book.entries.length > MAX_ENTRIES) {
+      book.entries.splice(0, book.entries.length - MAX_ENTRIES)
+      rebuildDf(book)
+    }
     book.stats.cleared++
   } catch {
     // 埋点失败绝不能影响清除本身
@@ -93,10 +164,16 @@ export function attributeText(sessionId, text, channel) {
     const present = new Set(String(text).match(TOKEN_RE) || [])
     for (const entry of book.entries) {
       if (entry.hit || entry.tokens.length === 0) continue
-      if (entry.tokens.some((token) => present.has(token))) {
+      const matched = entry.tokens.filter((token) => present.has(token))
+      if (matched.length === 0) continue
+      if (matched.some((token) => isRare(book, token))) {
         entry.hit = channel
         entry.hitAt = Date.now()
         book.stats[channel] = (book.stats[channel] || 0) + 1
+      } else if (!entry.commonSeen) {
+        // 只有样板词命中：不算复用证据，条目留着等稀有记号（避免被工作区路径这种词提前吃掉）
+        entry.commonSeen = true
+        book.stats.common = (book.stats.common || 0) + 1
       }
     }
   } catch {
@@ -122,10 +199,16 @@ export function attributeCall(sessionId, toolName, argsString) {
         if (book.hints.length < MAX_HINTS && !known) book.hints.push({ turn: entry.turn, step: entry.step, tool: entry.tool })
         continue
       }
-      if (present.size > 0 && entry.tokens.some((token) => present.has(token))) {
+      if (present.size === 0) continue
+      const matched = entry.tokens.filter((token) => present.has(token))
+      if (matched.length === 0) continue
+      if (matched.some((token) => isRare(book, token))) {
         entry.hit = 'reuseArgs'
         entry.hitAt = Date.now()
         book.stats.reuseArgs = (book.stats.reuseArgs || 0) + 1
+      } else if (!entry.commonSeen) {
+        entry.commonSeen = true
+        book.stats.common = (book.stats.common || 0) + 1
       }
     }
   } catch {
@@ -222,6 +305,7 @@ export function summaryText(sessionId) {
       '转述·文本 ' + (stats.carryText || 0) + '(' + pct(stats.carryText || 0) + ')',
       '转述·推理 ' + (stats.carryReasoning || 0) + '(' + pct(stats.carryReasoning || 0) + ')',
       '参数复用 ' + (stats.reuseArgs || 0) + '(' + pct(stats.reuseArgs || 0) + ')',
+      '样板词命中 ' + (stats.common || 0) + '(' + pct(stats.common || 0) + ')',
       '未再用 ' + noneCount(stats) + '(' + pct(noneCount(stats)) + ')',
     ].join('，')
   } catch {
@@ -235,7 +319,7 @@ export async function persist(sessionId, logsDir) {
     const book = books.get(sessionId)
     if (!book || (book.stats.cleared || 0) === 0) return null
     const payload = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       sessionId,
       updatedAt: Date.now(),
       stats: Object.assign({}, book.stats, { none: noneCount(book.stats) }),
@@ -244,7 +328,7 @@ export async function persist(sessionId, logsDir) {
         step: entry.step,
         tool: entry.tool,
         chars: entry.chars,
-        channel: entry.hit || 'none',
+        channel: entry.hit || (entry.commonSeen ? 'common' : 'none'),
         channelAt: entry.hitAt || null,
       })),
     }

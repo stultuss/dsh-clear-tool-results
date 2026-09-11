@@ -2,6 +2,17 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。此处只记录版本之间的行为差异。
 
+## [0.6.5] - 2026-09-12
+
+### 修复
+
+- **PTC 索引行真正生效**：0.6.4 试图从会话事件流里取 `tool/ptc-dispatch`，实测拿不到（重启后索引行仍是 `run_code → const r = await tools.bas…`）。现在三个来源依次尝试：hook 里自己收下的子调用 → 事件流里的子调用 → 直接解析 `run_code` 的代码（`tools.bash({ command: '…' })`），因此 PTC 下索引行稳定显示 `bash → git status --porcelain…`；三个来源都没有时回退外层 `tool/call`。
+
+### 变更
+
+- **归因只认"稀有记号"**：只有在该会话已登记结果里出现 ≤30% 的记号才算复用证据（`carryText` / `carryReasoning` / `reuseArgs`）。此前任何记号命中即计数，会被工作区路径、`index.mjs` 这类到处都有的词撑满——0.6.3/0.6.4 写下的 `转述·推理 13/21` 就是这么来的，与旧口径不可比。只被样板词命中过的条目记入新的 `样板词命中`（诊断用），并且**不再被提前消费**，之后仍可被稀有记号归因。
+- `usage.json` 的 `schemaVersion` 升到 2：`stats` 多一个 `common`，条目 `channel` 可能是 `common`。
+
 ## [0.6.4] - 2026-09-12
 
 ### 修复
