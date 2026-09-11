@@ -191,8 +191,10 @@ export function markCleared(sessionId, info) {
       ? book.entries.find((item) => item.turn === turn && item.step === step && item.callKey === callKey)
       : null
     if (!entry) {
+      // 同一 (turn, step) 里可能有多条结果：按登记顺序取第一条尚未清除的，
+      // 避免 callKey 失配时又建一条重复条目（重复条目会把归因统计撑大）。
       const same = book.entries.filter((item) => item.turn === turn && item.step === step && !item.cleared)
-      if (same.length === 1) entry = same[0]
+      if (same.length > 0) entry = same[0]
     }
     if (!entry) entry = recordResult(sessionId, info)
     if (entry && !entry.cleared) {

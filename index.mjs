@@ -941,6 +941,20 @@ function readToolResultLogTool(ctx) {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     async execute(args, exec) {
+    // 0.6.7：把 "3" 这类字符串编号归一化成数字。此前 typeof 判断会因类型不符
+    // 直接落到"列出归档轮次"分支，模型看到的是"取回为空"，却没有任何报错。
+    if (args && typeof args === 'object') {
+      for (const key of ['turn', 'step']) {
+        const raw = args[key]
+        if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
+          try {
+            args[key] = Number(raw.trim())
+          } catch {
+            // 参数被冻结时保持原样
+          }
+        }
+      }
+    }
       const session = exec.agent?.session
       if (!session) return { error: '无可用会话上下文' }
       const logsDir = logsDirOf(ctx, session)
@@ -1009,6 +1023,8 @@ async function readByTurn(session, logsDir, turn) {
     timeFrom: data.timeFrom,
     timeTo: data.timeTo,
     toolResults: data.toolResults ?? [],
+    steps: data.steps ?? [],
+    note: '原文在 toolResults[].text；steps 是按步汇总（哪几步有归档）。',
   }
 }
 
@@ -1063,6 +1079,7 @@ async function readByStep(session, logsDir, turn, step) {
     timeFrom: toolResults[0]?.time ?? data?.timeFrom,
     timeTo: toolResults[toolResults.length - 1]?.time ?? data?.timeTo,
     toolResults,
+    note: '原文在 toolResults[].text。',
   }
 }
 
@@ -1104,6 +1121,17 @@ async function collectTurnData(session, logsDir, turn) {
   }
   const entries = [...bySeq.values()].sort((a, b) => a.seq - b.seq)
   if (entries.length === 0) return null
+  // 0.6.7：整轮取回时附带按步汇总，模型可以直接看到哪几步有归档，不必再试错。
+  const byStep = new Map()
+  for (const entry of entries) {
+    const step = stepOfEntry(entry)
+    if (typeof step !== 'number') continue
+    const record = byStep.get(step) ?? { turn, step, count: 0, timeFrom: entry.time ?? null, timeTo: entry.time ?? null }
+    record.count += 1
+    if (typeof entry.time === 'number') record.timeTo = entry.time
+    byStep.set(step, record)
+  }
+  const steps = [...byStep.values()].sort((a, b) => a.step - b.step)
   const times = entries.map((entry) => entry.time).filter((time) => typeof time === 'number').sort((a, b) => a - b)
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -1113,6 +1141,7 @@ async function collectTurnData(session, logsDir, turn) {
     timeFrom: times[0],
     timeTo: times[times.length - 1],
     toolResults: entries,
+    steps,
   }
 }
 
