@@ -1,36 +1,16 @@
 // DSH 宿主插件：按轮归档并清除工具结果。
-// 启用时（默认，普通模式 round）：
+// 启用时（默认）：
 //   1. 每轮结束，将该轮原始 tool/result 事件（来自追加式会话日志，未被改写）
 //      归档到会话目录 tool-result-logs/round-NNNN.json（附 index.json 清单）；
 //   2. 将已结束轮次的工具结果显示替换为占位符（注明轮次，提示 read_tool_result_log）；
-//   3. 注册 read_tool_result_log 工具，模型可按轮次（可精确到 step）或时间读取归档。
-// overclock 模式（激进）：在同一轮内按 step 滞后一步清除——
-//   第 N 步结果仅对第 N+1 步的决策可见；第 N+1 步 step/end 时把第 N 步替换为占位符，
-//   并把刚结束的 step 归档为 round-NNNN-step-MMM.json（附 index.json steps 清单），
-//   需要更早步骤时模型用 read_tool_result_log(turn, step) 自行取回。
-// 命令：/clear-tool-results on|off|status|overclock；状态存于 $DSH_HOME/clear-tool-results.json。
-// 时机：DSH 在 turn/start 后同步组装 prompt，且 append 有重入保护，
-// 故普通模式清除在上一轮 turn/end 执行；overclock 在 step/end 事件后、下一步
-// prompt 组装前（queueMicrotask + 先清除后异步归档）执行。
+//   3. 注册 read_tool_result_log 工具，模型可按轮次或时间读取归档。
+// 归档上限：原文超过 ARCHIVE_MAX_BYTES（UTF-8）的结果不保存，占位符提示重新执行原工具。
+// 命令：/clear-tool-results on|off|status；状态存于 $DSH_HOME/clear-tool-results.json。
+// 时机：DSH 在 turn/start 后同步组装 prompt，且 append 有重入保护，故清除在上一轮 turn/end 执行。
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises'
 import { appendFileSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import * as usage from './usage.mjs'
-
-// 归因埋点用的"当前位置"游标：markRead 需要知道这次取回发生在第几轮第几步（0.6.6）
-const sessionCursor = new Map()
-
-/** 归因埋点用：事件所在的轮/步。 */
-function eventRef(event) {
-  const turn = event?.data?.turn
-  const step = event?.data?.step
-  return {
-    turn: typeof turn === 'number' ? turn : null,
-    step: typeof step === 'number' ? step : null,
-  }
-}
-
 /** 取回工具的参数归一化：只把纯数字字符串的 turn/step 变成数字，其余原样透传。 */
 function normalizeReadArgs(input) {
   const args = { ...(input ?? {}) }
@@ -57,14 +37,7 @@ const TOOL_RESULT = 'tool/result'
 const TOOL_CALL = 'tool/call'
 const TURN_END = 'turn/end'
 const TURN_START = 'turn/start'
-const STEP_END = 'step/end'
-const MODE_ROUND = 'round'
-const MODE_OVERCLOCK = 'overclock'
 const SCHEMA_VERSION = 2
-const MODE_LABEL = {
-  [MODE_ROUND]: '普通模式（每轮结束清除）',
-  [MODE_OVERCLOCK]: 'overclock（每步清除，滞后一步）',
-}
 const UNKNOWN_TOOL = 'unknown_tool'
 const LOG_DIR_NAME = 'tool-result-logs'
 const INDEX_FILE = 'index.json'
@@ -73,83 +46,24 @@ const SESSIONS_ROOT = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'ses
 /** 告警日志（只在异常路径写）。 */
 const WARN_LOG_FILE = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'clear-tool-results.log')
 
-/** 载入核心补丁管理器（与本插件同仓库）；不可用时返回 null。 */
-async function loadPatchManager() {
-  try {
-    return await import(new URL('./patches/patch-core.mjs', import.meta.url).href)
-  } catch {
-    return null
-  }
-}
-
-/** overclock 需要核心补丁，round/off 不需要；返回可拼进命令回复的一行说明。 */
-async function syncCorePatch(action) {
-  const manager = await loadPatchManager()
-  if (!manager) return '（未找到补丁管理器 patches/patch-core.mjs，可手动运行 npm run patch:apply）'
-  try {
-    const root = manager.resolveCoreRoot()
-    if (!root) return '（未定位到 dsh 核心目录，可手动运行 npm run patch:apply -- --root <dsh 目录>）'
-    // 顺带校准 surface op 键名：>= 0.1.5 的核心要求 startSeq/endSeq
-    rememberOpKeys(manager.surfaceOpKeys?.(root))
-    if (action === 'apply') {
-      const result = manager.applyPatches(root)
-      return result.changed ? '；核心补丁已应用，重启 dsh GUI 后生效' : '；核心补丁已处于应用状态'
-    }
-    const result = manager.revertPatches(root)
-    return result.changed ? '；核心补丁已回退，重启 dsh GUI 后生效' : '；核心补丁未应用，无需回退'
-  } catch (error) {
-    return `（补丁操作失败：${String(error?.message ?? error)}；可手动运行 npm run patch:apply 或 patch:revert）`
-  }
-}
-
-/** 载入时按核心源码校准 surface op 键名；校准失败时按会话头版本兜底（见 preferredOpKeys）。 */
-async function calibrateSurfaceOpKeys() {
-  const manager = await loadPatchManager()
-  if (!manager?.surfaceOpKeys) return
-  try {
-    rememberOpKeys(manager.surfaceOpKeys())
-  } catch {
-    // 未定位到核心目录：保持未校准，写入时按会话头版本选择拼写
-  }
-}
-
-/** status 命令用的补丁状态行。 */
-async function corePatchStatusLine() {
-  const manager = await loadPatchManager()
-  if (!manager) return '\n核心补丁：未知（未找到 patches/patch-core.mjs）'
-  try {
-    const root = manager.resolveCoreRoot()
-    if (!root) return '\n核心补丁：未知（未定位到 dsh 核心目录）'
-    const status = manager.patchStatus(root)
-    const label = status.applied
-      ? (status.upgradable ? '已应用（有可升级位点）' : '已应用')
-      : status.functional
-        ? '已应用（旧补丁态，建议升级）'
-        : status.files.every((file) => file.state === 'absent') ? '未应用' : '不完整'
-    const detail = status.files
-      .map((file) => `${file.rel.includes('agent-loop') ? 'agent-loop' : 'session'}=${file.state}`)
-      .join(' ')
-    const hint = status.functional ? '' : '；overclock 模式建议应用补丁（命令会自动处理）'
-    return `\n核心补丁：${label}（${detail}）${hint}`
-  } catch (error) {
-    return `\n核心补丁：检测失败（${String(error?.message ?? error)}）`
-  }
-}
-
 /**
- * 插件告警：既交给 ctx.logger，也追加到 $DSH_HOME/clear-tool-results.log。
- * 宿主默认不把 logger 写到任何可读文件，清除失败就完全看不见——排查时无据可查，
- * 所以这里自己落一份（只在异常路径写，正常路径不产生任何 I/O）。
+ * 归档上限（UTF-8 字节）。harness 的 spill 策略（`@deepseek-ai/dsh-spill-policy`，本机
+ * `maxInlineBytes = 50000`）会把超过 50000 字节的结果换成「首尾预览 + 通知」并掐掉中间，
+ * 所以超过本上限的结果即使归档、取回时也拿不到完整原文 —— 索性不保存：原处只留
+ * 「已清除、需要就重新执行原工具」的占位符，并把这条规则写进工具描述告知 Agent。
  */
-/** 追踪一行（清除决策链路的每一步），与告警写同一个文件，便于一次复现就定位。 */
-function trace(message) {
-  try {
-    appendFileSync(WARN_LOG_FILE, `${new Date().toISOString()} [trace] ${message}\n`, 'utf8')
-  } catch {
-    // 追踪失败不影响主流程
-  }
+const ARCHIVE_MAX_BYTES = 49000
+/** UTF-8 字节数：归档与渲染都按字节判，中文结果不能按字符估。 */
+const byteLen = (text) => Buffer.byteLength(String(text ?? ''), 'utf8')
+/** 该归档条目是否值得保存：原文在字节上限内。 */
+function archivable(entry) {
+  return byteLen(resultTextOf(entry?.event?.data?.message)) <= ARCHIVE_MAX_BYTES
 }
-
+/**
+ * 插件告警：既交给 ctx.logger，也追加到 $DSH_HOME/clear-tool-results.log（**只有异常路径写**，
+ * 正常路径零 I/O）。宿主默认不把 logger 写成任何可读文件，清除失败就完全看不见——所以自己落一份。
+ * 注意：0.7.0 起**不再有 per-turn/per-step 追踪**（原 `[trace]` 行），这个文件只在出错时才有内容。
+ */
 function warn(ctx, message) {
   const line = `${new Date().toISOString()} ${message}`
   try {
@@ -166,53 +80,33 @@ function warn(ctx, message) {
 
 export function apply(ctx) {
   const disposers = []
-  // 载入即校准 surface op 键名（<=0.1.4 → start/end，>=0.1.5 → startSeq/endSeq）
-  calibrateSurfaceOpKeys().catch(() => {})
   disposers.push(ctx.commands.register({
     name: 'clear-tool-results',
-    description: '工具结果归档并清除开关：普通模式每轮结束归档并清除；overclock 模式在同一轮内逐步归档并滞后一步清除，需更早结果时模型可 read_tool_result_log(turn, step) 取回。用法：/clear-tool-results on|off|status|overclock',
-    input: { hint: 'on|off|status|overclock' },
+    description: '工具结果归档并清除开关：每轮结束把该轮工具结果归档到会话 tool-result-logs 并从对话清除，模型可用 read_tool_result_log(turn) 取回。用法：/clear-tool-results on|off|status',
+    input: { hint: 'on|off|status' },
     recordInput: false,
     handler: async ({ rawInput, agent }) => {
       const arg = rawInput.trim().toLowerCase()
       if (arg === 'on') {
-        const patchNote = await syncCorePatch('revert')
-        await writeState({ enabled: true, mode: MODE_ROUND })
+        await writeState({ enabled: true })
         if (agent?.session) {
           queueMicrotask(() => {
             enableNow(ctx, agent.session).catch((error) => warn(ctx, String(error)))
           })
         }
-        return { kind: 'success', text: '已启用（普通模式）：工具结果按轮归档，并在下一轮开始前从对话清除' + patchNote }
-      }
-      if (arg === 'overclock') {
-        const patchNote = await syncCorePatch('apply')
-        await writeState({ enabled: true, mode: MODE_OVERCLOCK })
-        if (agent?.session) {
-          queueMicrotask(() => {
-            enableNow(ctx, agent.session).catch((error) => warn(ctx, String(error)))
-          })
-        }
-        return { kind: 'success', text: '已启用（overclock 模式）：每一步工具结果归档后滞后一步清除，更早步骤需 read_tool_result_log(turn, step) 取回' + patchNote }
+        return { kind: 'success', text: '已启用：工具结果按轮归档，并在下一轮开始前从对话清除' }
       }
       if (arg === 'off') {
-        const patchNote = await syncCorePatch('revert')
-        const state = await readState()
-        await writeState({ enabled: false, mode: state.mode })
-        return { kind: 'success', text: '已禁用：工具结果保留在对话中，不再归档' + patchNote }
+        await writeState({ enabled: false })
+        return { kind: 'success', text: '已禁用：工具结果保留在对话中，不再归档' }
       }
       if (arg === 'status') {
         const state = await readState()
-        const modeText = MODE_LABEL[state.mode] ?? MODE_LABEL[MODE_ROUND]
-        const usageLine = agent?.session ? usage.summaryText(agent.session.id) : null
-        const text = state.enabled
-          ? `当前状态：已启用（${modeText}）`
-          : `当前状态：已禁用（上次模式：${modeText}）`
-        const lines = [text + (await corePatchStatusLine()), `插件版本：${PLUGIN_VERSION}`]
-        if (usageLine) lines.push(usageLine)
+        const text = state.enabled ? '当前状态：已启用' : '当前状态：已禁用'
+        const lines = [text, `插件版本：${PLUGIN_VERSION}`]
         return { kind: 'success', text: lines.join('\n') }
       }
-      return { kind: 'error', text: '用法：/clear-tool-results on|off|status|overclock' }
+      return { kind: 'error', text: '用法：/clear-tool-results on|off|status' }
     },
   }))
   disposers.push(ctx.on('session/event', (session, event) => {
@@ -226,66 +120,13 @@ export function apply(ctx) {
       queueMicrotask(() => {
         onTurnStart(ctx, session, turn).catch((error) => warn(ctx, String(error)))
       })
-    } else if (event.type === STEP_END) {
-      const turn = event.data.turn
-      const step = event.data.step
-      queueMicrotask(() => {
-        onStepEnd(ctx, session, turn, step).catch((error) => warn(ctx, String(error)))
-      })
-    } else if (event.type === 'tool/result') {
-      // 归因埋点（只观测，0.6.6）：结果一到就登记条目。此前条目在"清除时"才建立，而清除发生在紧随
-      // 其后的那一步结束之后 —— 于是"看完就用"（可见窗口内的复用）永远无从归因，会被记成 none。
-      try {
-        const data = event.data
-        const info = describeClearedResult(session, data)
-        const text = String(info?.text ?? '')
-        if (!(text.startsWith('[第 ') && text.includes('已清除归档'))) {
-          sessionCursor.set(session.id, { turn: data?.turn ?? null, step: data?.step ?? null })
-          usage.recordResult(session.id, {
-            turn: data?.turn,
-            step: data?.step,
-            tool: info?.tool,
-            callKey: info?.callKey,
-            text,
-          })
-        }
-      } catch (error) {
-        warn(ctx, '归因埋点失败 ' + String(error))
-      }
-    } else if (event.type === 'assistant/message') {
-      // 归因埋点（只观测，见 usage.mjs）：结果被清除后，具体事实是否被转述进推理/可见文本
-      try {
-        let text = ''
-        let reasoning = ''
-        for (const part of event.data?.message?.content ?? []) {
-          if (!part) continue
-          if (part.type === 'reasoning' || part.type === 'thinking') reasoning += String(part.text ?? '')
-          else if (typeof part === 'string') text += part
-          else if (part.text) text += String(part.text)
-        }
-        const ref = eventRef(event)
-        sessionCursor.set(session.id, ref)
-        usage.attributeText(session.id, text, 'carryText', ref)
-        usage.attributeText(session.id, reasoning, 'carryReasoning', ref)
-      } catch (error) {
-        warn(ctx, '归因埋点失败 ' + String(error))
-      }
-    } else if (event.type === 'tool/call') {
-      // 归因埋点（只观测）：同参重跑 -> rerun；用上早先结果里的具体值 -> reuseArgs
-      try {
-        const ref = eventRef(event)
-        sessionCursor.set(session.id, ref)
-        usage.attributeCall(session.id, event.data?.name, usage.argsText(event.data?.arguments), ref)
-      } catch (error) {
-        warn(ctx, '归因埋点失败 ' + String(error))
-      }
     } else if (event.type === 'tool/ptc-dispatch') {
-      // 归因埋点 + 索引行（只观测）：run_code 内部的子调用。0.6.4 实测事件流里拿不到它们，
-      // 所以在这里自己收一份，占位符索引才能显示真实动作（bash → git status）
+      // 索引行专用：run_code（PTC）内部真正干活的子调用，事件流里拿不到它们，
+      // 所以在这里自己收一份，占位符索引才能显示真实动作（bash → git status）。
       try {
-        usage.recordPtcDispatch(session.id, event.data)
+        recordPtcDispatch(session.id, event.data)
       } catch (error) {
-        warn(ctx, '归因埋点失败 ' + String(error))
+        warn(ctx, '索引登记失败 ' + String(error))
       }
     }
   }))
@@ -308,76 +149,26 @@ async function onTurnEnd(ctx, session, endedTurn) {
       if (typeof endedTurn === 'number') await archiveUnarchived(session, endedTurn - 1, logsDir)
       // 刷新刚结束的轮次，保证归档完整
       if (typeof endedTurn === 'number') await archiveTurn(session, endedTurn, logsDir, true)
-      // 归因埋点落盘（0.6.4）：本轮被清除的结果后来从哪条路被"再用"；写失败要可见
-      try {
-        await usage.persist(session.id, logsDir)
-      } catch (error) {
-        warn(ctx, '归因埋点落盘失败：' + String(error))
-      }
     })
   } catch (error) {
     // 归档失败不能连带跳过清除：否则工具结果会一直留在上下文里（0.1.5 上曾整轮不生效）
     warn(ctx, '轮末归档失败 ' + String(error))
   }
-  // 普通模式清除整轮；overclock 也在此兜底清除该轮最后剩余步骤
+  // 清除该轮全部工具结果（含最后一步）
   try {
-    const cleared = clearCompletedToolResults(session, endedTurn)
-    trace(`turn/end turn=${endedTurn} 清除 ${cleared?.cleared ?? '?'} 条（surface 节点 ${session.surface.nodes.length}）`)
+    clearCompletedToolResults(session, endedTurn)
   } catch (error) {
     warn(ctx, '轮末清除失败 ' + String(error))
   }
 }
 
-/** 记录每个会话在上一次 turn/start 时看到的系列代次，用于补齐缺失的每轮边界。 */
-const lastSeriesGeneration = new WeakMap()
-
 async function onTurnStart(ctx, session, turn) {
   // 先做同步兜底（不 await，尽量赶在首条请求组装之前），再进入需要异步读盘的归档流程。
-  // overclock 需要每轮恰好一次系列边界：若上一轮结束时没有产生边界（空轮、被中断的轮），
-  // 在这里补一次内容不变的替换。仅当核心补丁提供 seriesGeneration 时启用，
-  // 否则旧核心会把这次替换当成新系列，重新造成每步重复展示。
   // 插件已关闭时不再产生任何写入。
-  const state = readStateSync()
-  if (state.enabled && state.mode === MODE_OVERCLOCK && supportsSeriesGeneration(session)) {
-    const generation = session.surface.seriesGeneration
-    try {
-      if (lastSeriesGeneration.get(session) === generation) nudgeSeries(session, turn)
-    } catch (error) {
-      warn(ctx, '轮首系列边界替换失败 ' + String(error?.message ?? error))
-    }
-    lastSeriesGeneration.set(session, session.surface.seriesGeneration)
-  }
   if (!(await readEnabled())) return
   const logsDir = logsDirOf(ctx, session)
   await enqueue(session.id, async () => {
     if (typeof turn === 'number') await archiveUnarchived(session, turn, logsDir)
-  })
-}
-
-/**
- * overclock 模式的 step/end 处理：
- *   1. 先把上一步（step - 1）的工具结果替换为占位符——必须同步、先于任何 I/O 完成，
- *      保证下一步 prompt 组装（deriveMessages）时该步结果已不可见；
- *   2. 再把刚结束的这一步归档为 round-NNNN-step-MMM.json，供本轮中途自主读取。
- */
-async function onStepEnd(ctx, session, turn, step) {
-  // 时机敏感：同步读取缓存状态，先清除上一步，之后才允许异步磁盘归档
-  const state = readStateSync()
-  if (!state.enabled || state.mode !== MODE_OVERCLOCK) {
-    trace(`step/end turn=${turn} step=${step} 跳过（enabled=${state.enabled} mode=${state.mode}）`)
-    return
-  }
-  if (typeof turn !== 'number' || typeof step !== 'number') return
-  try {
-    const { cleared, matched } = clearStepToolResults(session, turn, step - 1)
-    trace(`step/end turn=${turn} step=${step}：清除 step=${step - 1} 候选 ${matched} / 已清 ${cleared}（surface 节点 ${session.surface.nodes.length}）`)
-  } catch (error) {
-    // 清除失败不能拖垮归档：否则一个被拒绝的 replace 会让之后每一步都不再归档
-    warn(ctx, '逐步清除失败 ' + String(error))
-  }
-  const logsDir = logsDirOf(ctx, session)
-  await enqueue(session.id, async () => {
-    await archiveStep(session, turn, step, logsDir)
   })
 }
 
@@ -428,13 +219,8 @@ function currentOpenTurn(session) {
  * 不开启新系列，否则 Chat 界面会为每条被清除的结果渲染一次系统提示词 ——
  * 一次批量清除（启用插件、轮末清除）能瞬间产生上百个系列，直接把前端拖死。
  */
-/** overclock：每轮仅注入一次"可见性规则"扩展占位符，键为 `${sessionId}:${turn}`。 */
-const extendedHintRounds = new Set()
-
 function clearToolResultsWhere(session, matches) {
   const nodes = [...session.surface.nodes]
-  const overclock = readStateSync().mode === MODE_OVERCLOCK
-  const hintedThisCall = new Set()
   let cleared = 0
   let matched = 0
   let skippedNotAppend = 0
@@ -453,32 +239,21 @@ function clearToolResultsWhere(session, matches) {
     if (!matches(data)) continue
     matched += 1
     const turn = data?.turn
-    const step = data?.step
-    const key = overclock && typeof turn === 'number' ? `${session.id}:${turn}` : null
-    const extended =
-      key !== null &&
-      typeof step === 'number' &&
-      !extendedHintRounds.has(key) &&
-      !hintedThisCall.has(key)
-    if (extended) {
-      extendedHintRounds.add(key)
-      hintedThisCall.add(key)
-    }
     // 逐条独立：某一条目标已不在 surface（被别的 replace/压缩遮蔽）时只跳过这一条，
     // 不影响本次其余清除，也不把异常抛给调用方（逐步清除后仍要归档、轮末仍要收尾）。
-    // 索引行与归因埋点都在这里取一次原文（0.6.3）：占位符带上"这一步里是什么"，
-    // 之后模型是否转述/重用由 usage.mjs 判断。
+    // 索引行在这里取一次原文：占位符带上「这一步里是什么」。
     const info = describeClearedResult(session, data)
     try {
-      replaceToolResult(session, seq, data, clearedText(turn, step, extended, info.index, usage.takeHint(session.id)))
-      usage.markCleared(session.id, { turn, step, tool: info.tool, callKey: info.callKey, text: info.text })
+      replaceToolResult(
+        session,
+        seq,
+        data,
+        clearedText(turn, info.index, info.archived, info.overLimit, info.bytes),
+      )
       cleared += 1
     } catch (error) {
       warn(null, `清除失败（目标 seq ${seq} 已不在 surface 或写入被拒）：${String(error?.message ?? error)}`)
     }
-  }
-  if (matched !== cleared || skippedWrongType > 0) {
-    trace(`清除统计：候选 ${matched}、已清 ${cleared}、非 append 跳过 ${skippedNotAppend}、取不到事件 ${skippedWrongType}`)
   }
   return { cleared, matched }
 }
@@ -486,71 +261,10 @@ function clearToolResultsWhere(session, matches) {
 /** 将轮次 <= untilTurn 的 tool/result 节点替换为占位符。 */
 function clearCompletedToolResults(session, untilTurn) {
   const { cleared } = clearToolResultsWhere(session, (data) => typeof data?.turn === 'number' && data.turn <= untilTurn)
-  // 清除型替换不再开启新系列（核心按「内容被改写」判定），所以每轮结束时补一次内容不变的替换，
-  // 作为该轮唯一的系列边界（Chat 每轮展示一次系统提示词）。
-  // 普通模式下没有任何可清除结果时保持旧行为（不产生边界）。
-  if (cleared > 0 || readStateSync().mode === MODE_OVERCLOCK) {
-    const before = supportsSeriesGeneration(session) ? session.surface.seriesGeneration : undefined
-    try {
-      const nudged = nudgeSeries(session, untilTurn)
-      trace(`系列边界：${nudged ? '已写入 1 次内容不变的替换' : '没有可用节点，跳过'}`)
-      // 边界替换必须做到「内容与原节点逐字节相同」，核心才会把它算作新系列。
-      // 一旦目标的占位文本与原文不同，核心会把它当成清除型替换，本轮就没有边界了。
-      if (nudged && before !== undefined && session.surface.seriesGeneration === before) {
-        warn(null, '系列边界未生效：核心把这次替换判成了内容清除（替换内容与原文不一致）')
-      }
-    } catch (error) {
-      warn(null, '系列边界替换失败 ' + String(error?.message ?? error))
-    }
-  }
   return { cleared }
 }
 
-/** overclock：将第 turn 轮第 step 步的工具结果替换为占位符（清除型，不开启新系列）。 */
-function clearStepToolResults(session, turn, step) {
-  return clearToolResultsWhere(session, (data) => data?.turn === turn && data?.step === step)
-}
-
-/**
- * 内容不变地替换一个 tool/result，用于制造一次系列边界。
- * 优先取本轮最后一个；本轮没有工具结果（空轮、被中断的轮）时退化为会话里最近的一条：
- * 内容不变地替换不改变历史展示，但同样只产生一次系列边界。
- */
-function nudgeSeries(session, turn) {
-  const events = eventsOf(session)
-  const nodes = [...session.surface.nodes]
-  let fallbackSeq = -1
-  let fallbackEvent = null
-  for (let index = nodes.length - 1; index >= 0; index -= 1) {
-    const seq = nodes[index]
-    const event = events[seq]
-    if (!event || event.type !== TOOL_RESULT) continue
-    if (event.data?.turn === turn) {
-      replaceToolResult(session, seq, event.data, placeholderTextOf(event.data.message))
-      return true
-    }
-    if (fallbackEvent === null) {
-      fallbackSeq = seq
-      fallbackEvent = event
-    }
-  }
-  if (fallbackEvent !== null) {
-    replaceToolResult(session, fallbackSeq, fallbackEvent.data, placeholderTextOf(fallbackEvent.data.message))
-    return true
-  }
-  return false
-}
-
-/** 从占位符消息里取出纯文本，保证 nudgeSeries 的替换内容与现状一致。 */
-function placeholderTextOf(message) {
-  const first = message?.content?.[0]
-  if (!first) return ''
-  if (first.type === 'text') return first.text ?? ''
-  const inner = first.content?.[0]
-  return inner?.text ?? ''
-}
-
-/** 占位符索引 + 归因埋点共用：callId -> tool/call 事件。 */
+/** 占位符索引专用：callId -> tool/call 事件。 */
 function indexToolCalls(events) {
   const map = new Map()
   for (const event of events) {
@@ -600,7 +314,7 @@ function squashLine(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim()
 }
 
-/** 结果消息里的纯文本（埋点记号与规模统计用）。 */
+/** 结果消息里的纯文本（规模统计用）。 */
 function resultTextOf(message) {
   const parts = []
   const walk = (value) => {
@@ -678,48 +392,59 @@ function describeClearedResult(session, data) {
       if (event?.type !== TOOL_RESULT || event.surfaceOp !== 'append') continue
       if (event.data?.turn !== data?.turn || event.data?.step !== data?.step) continue
       const siblingCall = callOfResult(event.data, calls)
+      const siblingText = resultTextOf(event.data?.message)
       siblings.push({
         tool: toolNameOfResult(siblingCall, event.data),
         hint: callHintOf(siblingCall),
-        chars: resultTextOf(event.data?.message).length,
+        chars: siblingText.length,
+        bytes: byteLen(siblingText),
         failed: resultFailed(event.data),
       })
     }
     // PTC 模式下真正干活的是 run_code 里的子调用：索引行优先显示它们。
     // 三个来源依次尝试：hook 收下的子调用 -> 事件流里的子调用 -> 直接解析 run_code 的代码
-    let items = usage.ptcItems(session.id, data?.turn, data?.step)
+    let items = ptcItems(session.id, data?.turn, data?.step)
     if (items.length === 0) items = ptcItemsOf(events, data?.turn, data?.step)
     if (items.length === 0) items = innerCallsOf(call)
     if (items.length > 0 && siblings.length > 0) {
       items[0].chars = siblings[0].chars
       items[0].failed = siblings[0].failed
     }
+    const text = resultTextOf(data?.message)
+    const bytes = byteLen(text)
+    // 超限结果不落盘：占位符必须说清「没得取回」，而不是给一个取不回来的坐标。
+    const overLimit = siblings.filter((s) => s.bytes > ARCHIVE_MAX_BYTES).length
     return {
       tool,
-      text: resultTextOf(data?.message),
-      callKey: usage.callKeyOf(tool, usage.argsText(call?.arguments)),
-      index: usage.indexText(items.length > 0 ? items : siblings),
+      text,
+      bytes,
+      archived: bytes <= ARCHIVE_MAX_BYTES,
+      overLimit,
+      callKey: callKeyOf(tool, argsText(call?.arguments)),
+      index: indexText(items.length > 0 ? items : siblings),
     }
   } catch {
     return { tool: 'tool', text: '', callKey: null, index: '' }
   }
 }
 
-function clearedText(turn, step, extended, index, hint) {
+function clearedText(turn, index, archived = true, overLimit = 0, bytes = 0) {
   const indexPart = index ? `：${index}` : ''
-  const hintPart = hint ? `（提示：${hint}）` : ''
+  // 超限结果不归档：只说「已清除」，并让 Agent 重新执行原工具（没有可用的取回坐标）。
+  // 尺寸按字节报：索引行沿用「字符」标签，对中文结果会低估（曾把 60KB 结果的 spilled 预览标成 16.8k）。
+  if (!archived) {
+    const wherePart = typeof turn === 'number' ? `第 ${turn} 轮` : ''
+    const sizePart =
+      overLimit > 1 ? `${overLimit} 条结果` : bytes > 0 ? `该结果 ${(bytes / 1000).toFixed(1)}k 字节` : '该结果'
+    return `[${wherePart}工具结果已清除（${sizePart}，超过 ${ARCHIVE_MAX_BYTES} 字节上限，未归档）${indexPart}。未保存原文，如需请重新执行原工具获取。]`
+  }
+  const skippedPart =
+    overLimit > 0 ? `（本轮另有 ${overLimit} 条超 ${ARCHIVE_MAX_BYTES} 字节的结果未归档，需要时请重新执行原工具）` : ''
   const core =
-    typeof turn === 'number' && typeof step === 'number'
-      ? `[第 ${turn} 轮 第 ${step} 步工具结果已清除归档${indexPart}，可用 read_tool_result_log(turn: ${turn}, step: ${step}) 读取]`
-      : typeof turn === 'number'
-        ? `[第 ${turn} 轮工具结果已清除归档${indexPart}，可用 read_tool_result_log(turn: ${turn}) 读取]`
-        : `[工具结果已清除归档${indexPart}，可用 read_tool_result_log 读取]`
-  if (!extended || typeof turn !== 'number') return core + hintPart
-  const stepPart =
-    typeof step === 'number'
-      ? `；确实需要精确原文时，请恰好在使用它的那一步之前用 read_tool_result_log(turn: ${turn}, step: ${step}) 取回`
-      : ''
-  return `[第 ${turn} 轮工具结果已清除归档${indexPart}。可见性规则（overclock）：某一步的工具结果仅在紧随其后的下一步决策中可见，取回内容同样如此${stepPart}；若总结需引用多步内容，可在总结前用 read_tool_result_log(turn: ${turn}) 整轮取回一次。]` + hintPart
+    typeof turn === 'number'
+      ? `[第 ${turn} 轮工具结果已清除归档${indexPart}，可用 read_tool_result_log(turn: ${turn}) 读取]`
+      : `[工具结果已清除归档${indexPart}，可用 read_tool_result_log 读取]`
+  return core + skippedPart
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +485,9 @@ async function archiveTurn(session, turn, logsDir, overwrite) {
   for (const event of eventsOf(session)) {
     if (event.type !== TOOL_RESULT || event.surfaceOp !== 'append') continue
     if (event.data?.turn !== turn) continue
-    entries.push(entryOf(event, nameByCallId, callByCallId))
+    const entry = entryOf(event, nameByCallId, callByCallId)
+    if (!archivable(entry)) continue
+    entries.push(entry)
   }
   if (entries.length === 0) return
   const fileName = roundFileName(turn)
@@ -789,50 +516,6 @@ async function archiveTurn(session, turn, logsDir, overwrite) {
   if (existing >= 0) next.rounds[existing] = round
   else next.rounds.push(round)
   next.rounds.sort((a, b) => a.turn - b.turn)
-  next.updatedAt = Date.now()
-  await writeFile(join(logsDir, INDEX_FILE), JSON.stringify(next, null, 2), 'utf8')
-}
-
-/** overclock：把第 turn 轮第 step 步归档为 round-NNNN-step-MMM.json 并更新 index.steps。 */
-async function archiveStep(session, turn, step, logsDir) {
-  if (typeof turn !== 'number' || typeof step !== 'number') return
-  const { nameByCallId, callByCallId } = callIndex(session)
-  const entries = []
-  for (const event of eventsOf(session)) {
-    if (event.type !== TOOL_RESULT || event.surfaceOp !== 'append') continue
-    if (event.data?.turn !== turn || event.data?.step !== step) continue
-    entries.push(entryOf(event, nameByCallId, callByCallId))
-  }
-  if (entries.length === 0) return
-  const index = await readIndex(logsDir)
-  const next = index ?? emptyIndex(session)
-  const fileName = stepFileName(turn, step)
-  await mkdir(logsDir, { recursive: true })
-  await writeFile(join(logsDir, fileName), JSON.stringify({
-    schemaVersion: SCHEMA_VERSION,
-    sessionId: session.id,
-    workspace: session.header.cwd ?? null,
-    turn,
-    step,
-    timeFrom: entries[0].event.time,
-    timeTo: entries[entries.length - 1].event.time,
-    toolResults: entries,
-  }, null, 2), 'utf8')
-  const summary = {
-    turn,
-    step,
-    file: fileName,
-    timeFrom: entries[0].event.time,
-    timeTo: entries[entries.length - 1].event.time,
-    count: entries.length,
-    tools: [...new Set(entries.map((entry) => entry.toolName))],
-  }
-  const steps = Array.isArray(next.steps) ? next.steps : []
-  const existing = steps.findIndex((candidate) => candidate.turn === turn && candidate.step === step)
-  if (existing >= 0) steps[existing] = summary
-  else steps.push(summary)
-  steps.sort((a, b) => a.turn - b.turn || a.step - b.step)
-  next.steps = steps
   next.updatedAt = Date.now()
   await writeFile(join(logsDir, INDEX_FILE), JSON.stringify(next, null, 2), 'utf8')
 }
@@ -885,16 +568,11 @@ function emptyIndex(session) {
     workspace: session.header.cwd ?? null,
     updatedAt: Date.now(),
     rounds: [],
-    steps: [],
   }
 }
 
 function roundFileName(turn) {
   return `round-${String(turn).padStart(4, '0')}.json`
-}
-
-function stepFileName(turn, step) {
-  return `round-${String(turn).padStart(4, '0')}-step-${String(step).padStart(4, '0')}.json`
 }
 
 /** 从某轮条目中取出去重后的步骤号（老核心无 step 字段时为空）。 */
@@ -907,10 +585,82 @@ function distinctStepsOf(entries) {
 // read_tool_result_log：模型读取历史归档的工具结果
 // ---------------------------------------------------------------------------
 
+/** 输出预算（UTF-8 字节）：harness 的 spill 策略在 50000 字节处把结果换成「首尾预览 + 通知」并
+ *  **掐掉中间**（2026-09-14 实测：未截断的最大 49,656 字节、截断后预览 50,049 / 50,050 字节；
+ *  早先记的「约 31k 字符」是同一堵墙的字符侧读数）。used 从表头起算、末尾通知约 400 字节，
+ *  故整份载荷 ≤ 48400 字节，永不触发 harness 截断；插件自己按行切分并给出续取坐标，
+ *  也不落 spill（spill 是契约禁止的旁路通道）。 */
+const RENDER_BUDGET_BYTES = 48000
+
+/** 把归档条目渲染成紧凑纯文本（0.6.8）。
+ *  旧做法是 `JSON.stringify(条目, null, 2)`，而条目不只含 `text`，还带 `call`（整条工具调用事件）、
+ *  逐行 `meta`、以及重复的 seq/time/turn/step —— 同一个原文被塞了两遍，再叠上 JSON 转义与缩进，
+ *  实测返回体是原文的 3~4 倍（两份归档：11.4k → 44,889 字符；14.5k → 45,029），
+ *  直接撞上 harness 的截断线：29/63 次取回因此拿不全，并诱发 spill 绕道。
+ *  现在只输出：坐标 + 工具名 + 参数摘要 + 行窗口 + 原文，并受 RENDER_BUDGET_BYTES 约束。 */
+function renderRetrieval(args, value) {
+  if (value && typeof value.error === 'string') return `错误：${value.error}`
+  const parts = []
+  if (typeof value?.query === 'string' && value.query !== '') parts.push(`查询：${value.query}`)
+  const rounds = Array.isArray(value?.rounds) ? value.rounds : []
+  if (rounds.length > 0) {
+    parts.push(
+      `已归档轮次：${rounds
+        .map((round) => `turn ${round?.turn ?? '?'}（${round?.stepCount ?? 0} 步，${round?.count ?? '?'} 条）`)
+        .join('、')}`,
+    )
+  }
+  const entries = Array.isArray(value?.toolResults) ? value.toolResults : []
+  const offset = Math.max(1, Number(args?.offset ?? 1) || 1)
+  const limit = Number(args?.limit ?? 0) || 0
+  let used = byteLen(parts.join('\n'))
+  let shown = 0
+  let skipped = 0
+  for (const entry of entries) {
+    const text =
+      typeof entry?.text === 'string' && entry.text !== ''
+        ? entry.text
+        : String(resultTextOf(entry?.event?.data?.message) ?? '')
+    const lines = text.split('\n')
+    const outOfRange = offset > lines.length
+    const from = Math.min(offset, lines.length)
+    const to = limit > 0 ? Math.min(from + limit - 1, lines.length) : lines.length
+    const argsHint =
+      typeof entry?.call?.data?.arguments === 'string'
+        ? entry.call.data.arguments.replace(/\s+/g, ' ').slice(0, 120)
+        : ''
+    const head =
+      `--- turn ${entry?.turn ?? '?'} step ${entry?.step ?? '?'} · ${entry?.toolName ?? 'tool'}` +
+      `${argsHint === '' ? '' : ` · ${argsHint}`} · ${
+        outOfRange ? `第 ${lines.length} 行之后无内容（共 ${lines.length} 行）` : `第 ${from}-${to} 行 / 共 ${lines.length} 行`
+      } · ${text.length} 字符 / ${byteLen(text)} 字节 ---`
+    const body = lines.slice(from - 1, to).join('\n')
+    const tail = to < lines.length ? `\n…（本结果还有 ${lines.length - to} 行未显示；续取：offset=${to + 1}${limit > 0 ? `, limit=${limit}` : ''}）` : ''
+    const block = `${head}\n${body}${tail}`
+    if (used + byteLen(block) > RENDER_BUDGET_BYTES) {
+      skipped += 1
+      continue
+    }
+    parts.push(block)
+    used += byteLen(block) + 1
+    shown += 1
+  }
+  if (entries.length === 0 && rounds.length === 0) parts.push('（没有匹配的归档条目）')
+  if (shown > 0 && entries.length > 0) parts.push(`（共 ${entries.length} 条匹配，已显示 ${shown} 条）`)
+  if (skipped > 0) {
+    parts.push(
+      `⚠️ 还有 ${skipped} 条未显示：输出预算 ${RENDER_BUDGET_BYTES} 字节已到上限（harness 在 50000 字节处会掐掉中间并落盘）。` +
+        `请用 turn+step 精确取回，或用 offset/limit 分段取。`,
+    )
+  }
+  if (typeof value?.note === 'string' && value.note !== '') parts.push(value.note)
+  return parts.join('\n\n')
+}
+
 function readToolResultLogTool(ctx) {
   return {
     name: 'read_tool_result_log',
-    description: '读取被清理工具结果的原始数据（每轮归档到会话 tool-result-logs；overclock 模式下每步也归档）。当占位符或任务需要某步输出时调用：传 turn（轮次号）+ step（步骤号，1 起，一次模型决策为一步）可精确读取该步；只传 turn 读取整轮；传 time（ISO 8601 或毫秒时间戳）读取该时刻所在轮；都不传则返回已归档轮次列表。overclock 模式提醒：取回内容同样只存活一步，请取回后立即使用；若总结需引用多步原文，建议在总结前按轮整轮取回一次，避免中途反复小取回。',
+    description: `读取被清理工具结果的原始数据（每轮归档到会话 tool-result-logs，每轮结束写入 round-NNNN.json）。当占位符或任务需要某轮输出时调用：传 turn（轮次号）读取该轮；传 time（ISO 8601 或毫秒时间戳）读取该时刻所在轮；都不传则返回已归档轮次列表。归档上限：原文超过 ${ARCHIVE_MAX_BYTES} 字节（UTF-8；harness 在 50000 字节处会截断落盘）的结果**不保存**——其占位符会写明「已清除、未归档」，这种结果只能重新执行原工具获取，本工具取不回来。返回体是纯文本，超过输出预算时按行截断并给出 offset 续取坐标。`,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -919,13 +669,17 @@ function readToolResultLogTool(ctx) {
           type: ['integer', 'string'],
           description: '对话轮次编号（1 起），如 turn: 3 读取第 3 轮。用户指明轮次时优先使用。',
         },
-        step: {
-          type: ['integer', 'string'],
-          description: '步骤编号（1 起，一次模型决策即一步），需配合 turn 使用，如 turn: 3, step: 2 读取第 3 轮第 2 步。占位符注明 turn/step 时优先按此精确读取。',
-        },
         time: {
           type: 'string',
           description: 'ISO 8601 时间（如 2026-08-26T10:00:00+08:00）或毫秒时间戳，读取该时刻所在轮次。',
+        },
+        offset: {
+          type: ['integer', 'string'],
+          description: '可选：从原文第几行开始返回（1 起）。大结果只取一段时用，避免一次取回过大。',
+        },
+        limit: {
+          type: ['integer', 'string'],
+          description: '可选：最多返回多少行（配合 offset 精确取段）。不传则尽量多返回，受输出预算约束。',
         },
       },
     },
@@ -939,16 +693,14 @@ function readToolResultLogTool(ctx) {
           workspace: { type: 'string' },
           query: { type: 'string' },
           turn: { type: 'integer' },
-          step: { type: 'integer' },
           timeFrom: { type: 'number' },
           timeTo: { type: 'number' },
           toolResults: { type: 'array', items: {} },
           rounds: { type: 'array', items: {} },
-          steps: { type: 'array', items: {} },
           error: { type: 'string' },
         },
       },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      render: (args, value) => [{ type: 'text', text: renderRetrieval(args, value) }],
     },
     async execute(rawArgs, exec) {
     // 0.6.7：core 传进来的参数可能是冻结对象，直接赋值会被静默忽略 —— 复制一份再归一化。
@@ -958,12 +710,10 @@ function readToolResultLogTool(ctx) {
       const logsDir = logsDirOf(ctx, session)
       let result
       try {
-        if (typeof args.turn === 'number' && typeof args.step === 'number') {
-          result = await readByStep(session, logsDir, args.turn, args.step)
-        } else if (typeof args.step === 'number') {
-          result = { error: 'step 需配合 turn 使用，如 read_tool_result_log({ turn: 3, step: 2 })' }
-        } else if (typeof args.turn === 'number') {
+        if (typeof args.turn === 'number') {
           result = await readByTurn(session, logsDir, args.turn)
+        } else if (typeof args.step === 'number') {
+          result = { error: '已不再保留逐步归档：请用 turn 取回整轮，如 read_tool_result_log({ turn: 3 })' }
         } else if (typeof args.time === 'string') {
           result = await readByTime(session, logsDir, args.time)
         } else {
@@ -979,18 +729,7 @@ function readToolResultLogTool(ctx) {
         Array.isArray(result.toolResults) &&
         result.toolResults.length > 0
       ) {
-        result.note =
-          '取回提示（overclock）：归档内容同样只在紧随其后的下一步决策中可见，请立即使用；若总结需引用多步原文，建议总结前按轮整轮取回一次。'
-        // 归因埋点（只观测）：这次取回命中了哪些轮/步，用来统计"取回"渠道的真实占比
-        try {
-          usage.markRead(
-            session.id,
-            { turn: result.turn, step: result.step, time: result.timeFrom },
-            sessionCursor.get(session.id),
-          )
-        } catch {
-          // 忽略
-        }
+        result.note = '取回提示：归档在每轮结束时写入，之后随时可读；如需引用多轮原文，可在总结前逐轮取回。'
       }
       return result
     },
@@ -1021,133 +760,36 @@ async function readByTurn(session, logsDir, turn) {
     timeFrom: data.timeFrom,
     timeTo: data.timeTo,
     toolResults: data.toolResults ?? [],
-    steps: data.steps ?? [],
-    note: '原文在 toolResults[].text；steps 是按步汇总（哪几步有归档）。',
+    note: '原文在 event.data.message（取回时已展开为纯文本）。',
   }
 }
 
-/** 读取第 turn 轮第 step 步：优先 step 文件，老数据回退到整轮文件过滤。 */
-async function readByStep(session, logsDir, turn, step) {
-  if (!Number.isInteger(turn) || turn < 1) return { error: '轮次编号必须为正整数' }
-  if (!Number.isInteger(step) || step < 1) return { error: '步骤编号必须为正整数' }
-  let data = null
-  try {
-    data = JSON.parse(await readFile(join(logsDir, stepFileName(turn, step)), 'utf8'))
-  } catch {
-    // step 文件不存在：普通模式/老数据只有整轮文件
-  }
-  let toolResults = []
-  if (data) {
-    toolResults = data.toolResults ?? []
-  } else {
-    const whole = await readByTurn(session, logsDir, turn)
-    if (!whole.error) {
-      toolResults = (whole.toolResults ?? []).filter((entry) => stepOfEntry(entry) === step)
-    } else {
-      const steps = (await readIndex(logsDir))?.steps ?? []
-      const available = steps
-        .filter((candidate) => candidate.turn === turn)
-        .map((candidate) => candidate.step)
-      return {
-        sessionId: session.id,
-        workspace: session.header.cwd ?? null,
-        query: `第 ${turn} 轮 第 ${step} 步`,
-        error: `第 ${turn} 轮第 ${step} 步没有归档的工具结果（该轮已归档步骤：${available.join(', ') || '无'}）`,
-        steps: steps.slice(-50),
-      }
-    }
-  }
-  if (toolResults.length === 0) {
-    return {
-      sessionId: data?.sessionId ?? session.id,
-      workspace: data?.workspace ?? session.header.cwd ?? null,
-      query: `第 ${turn} 轮 第 ${step} 步`,
-      turn,
-      step,
-      error: `第 ${turn} 轮第 ${step} 步没有工具结果`,
-      toolResults: [],
-    }
-  }
-  return {
-    sessionId: data?.sessionId ?? session.id,
-    workspace: data?.workspace ?? session.header.cwd ?? null,
-    query: `第 ${turn} 轮 第 ${step} 步`,
-    turn,
-    step,
-    timeFrom: toolResults[0]?.time ?? data?.timeFrom,
-    timeTo: toolResults[toolResults.length - 1]?.time ?? data?.timeTo,
-    toolResults,
-    note: '原文在 toolResults[].text。',
-  }
-}
 
-/** 合并某轮所有归档来源：round-NNNN.json + round-NNNN-step-MMM.json，按 seq 去重排序。 */
+/** 读取某轮归档：round-NNNN.json（每轮结束时写入）。 */
 async function collectTurnData(session, logsDir, turn) {
-  const bySeq = new Map()
-  let sessionId = null
-  let workspace = null
+  let aggregate
   try {
-    const aggregate = JSON.parse(await readFile(join(logsDir, roundFileName(turn)), 'utf8'))
-    sessionId = aggregate.sessionId
-    workspace = aggregate.workspace
-    for (const entry of aggregate.toolResults ?? []) {
-      if (typeof entry?.seq === 'number') bySeq.set(entry.seq, entry)
-    }
+    aggregate = JSON.parse(await readFile(join(logsDir, roundFileName(turn)), 'utf8'))
   } catch {
-    // 无整轮文件：可能只有 step 文件（轮次进行中）
+    return null
   }
-  const prefix = `round-${String(turn).padStart(4, '0')}-step-`
-  let files = []
-  try {
-    files = (await readdir(logsDir))
-      .filter((file) => file.startsWith(prefix) && file.endsWith('.json'))
-      .sort()
-  } catch {
-    files = []
-  }
-  for (const file of files) {
-    try {
-      const chunk = JSON.parse(await readFile(join(logsDir, file), 'utf8'))
-      sessionId ??= chunk.sessionId
-      workspace ??= chunk.workspace
-      for (const entry of chunk.toolResults ?? []) {
-        if (typeof entry?.seq === 'number') bySeq.set(entry.seq, entry)
-      }
-    } catch {
-      // 跳过损坏/半写的 step 文件
-    }
-  }
-  const entries = [...bySeq.values()].sort((a, b) => a.seq - b.seq)
+  const entries = (aggregate.toolResults ?? [])
+    .filter((entry) => typeof entry?.seq === 'number')
+    .sort((a, b) => a.seq - b.seq)
   if (entries.length === 0) return null
-  // 0.6.7：整轮取回时附带按步汇总，模型可以直接看到哪几步有归档，不必再试错。
-  const byStep = new Map()
-  for (const entry of entries) {
-    const step = stepOfEntry(entry)
-    if (typeof step !== 'number') continue
-    const record = byStep.get(step) ?? { turn, step, count: 0, timeFrom: entry.time ?? null, timeTo: entry.time ?? null }
-    record.count += 1
-    if (typeof entry.time === 'number') record.timeTo = entry.time
-    byStep.set(step, record)
-  }
-  const steps = [...byStep.values()].sort((a, b) => a.step - b.step)
-  const times = entries.map((entry) => entry.time).filter((time) => typeof time === 'number').sort((a, b) => a - b)
+  const times = entries
+    .map((entry) => entry.time)
+    .filter((time) => typeof time === 'number')
+    .sort((a, b) => a - b)
   return {
     schemaVersion: SCHEMA_VERSION,
-    sessionId: sessionId ?? session.id,
-    workspace: workspace ?? session.header.cwd ?? null,
+    sessionId: aggregate.sessionId ?? session.id,
+    workspace: aggregate.workspace ?? session.header.cwd ?? null,
     turn,
     timeFrom: times[0],
     timeTo: times[times.length - 1],
     toolResults: entries,
-    steps,
   }
-}
-
-/** 兼容 v1 归档条目：step 可能在 entry.step（v2）或 entry.event.data.step（v1）。 */
-function stepOfEntry(entry) {
-  if (typeof entry?.step === 'number') return entry.step
-  const step = entry?.event?.data?.step
-  return typeof step === 'number' ? step : null
 }
 
 async function readByTime(session, logsDir, time) {
@@ -1180,38 +822,6 @@ async function listRounds(session, logsDir) {
   const index = await readIndex(logsDir)
   const rounds = [...(index?.rounds ?? [])]
   const known = new Set(rounds.map((round) => round.turn))
-  // overclock：当前轮次尚未生成 round-NNNN.json 但已有 step 文件——按轮汇总后也列出来，
-  // 避免模型不带参数查询时误以为没有归档可用
-  const byTurn = new Map()
-  for (const step of index?.steps ?? []) {
-    if (!step || known.has(step.turn)) continue
-    const group = byTurn.get(step.turn) ?? {
-      turn: step.turn,
-      inProgress: true,
-      count: 0,
-      stepCount: 0,
-      tools: new Set(),
-      timeFrom: Infinity,
-      timeTo: -Infinity,
-    }
-    group.count += step.count ?? 0
-    group.stepCount += 1
-    for (const tool of step.tools ?? []) group.tools.add(tool)
-    if (typeof step.timeFrom === 'number') group.timeFrom = Math.min(group.timeFrom, step.timeFrom)
-    if (typeof step.timeTo === 'number') group.timeTo = Math.max(group.timeTo, step.timeTo)
-    byTurn.set(step.turn, group)
-  }
-  for (const group of byTurn.values()) {
-    rounds.push({
-      turn: group.turn,
-      inProgress: true,
-      count: group.count,
-      stepCount: group.stepCount,
-      timeFrom: group.timeFrom === Infinity ? undefined : group.timeFrom,
-      timeTo: group.timeTo === -Infinity ? undefined : group.timeTo,
-      tools: [...group.tools],
-    })
-  }
   rounds.sort((a, b) => a.turn - b.turn)
   return {
     sessionId: session.id,
@@ -1275,16 +885,8 @@ const GEN_SEQ = 'seq'
 const GEN_LEGACY = 'legacy'
 let coreGeneration
 
-/** 记住校准结果（由补丁管理器给出的两代键名反推代数）。 */
-function rememberOpKeys(keys) {
-  if (keys !== OP_KEYS_LEGACY && keys !== OP_KEYS_SEQ) return
-  surfaceOpKeyNames = keys
-  coreGeneration = keys === OP_KEYS_LEGACY ? GEN_LEGACY : GEN_SEQ
-}
-
-/** 本次写入该用哪代键名。 */
+/** 本次写入该用哪代键名：按会话头版本（<3 用 start/end，>=3 用 startSeq/endSeq）。 */
 function preferredOpKeys(session) {
-  if (coreGeneration !== undefined) return surfaceOpKeyNames
   const version = session?.header?.version
   return typeof version === 'number' && version < 3 ? OP_KEYS_LEGACY : OP_KEYS_SEQ
 }
@@ -1330,11 +932,6 @@ function replaceToolResult(session, seq, data, text) {
   }
 }
 
-/** 核心补丁（seriesGeneration 双代数）是否已在当前进程生效。 */
-function supportsSeriesGeneration(session) {
-  return typeof session?.surface?.seriesGeneration === 'number'
-}
-
 function clearedMessage(message, text) {
   if (!message) return { content: [{ type: 'text', text }] }
   const first = message.content?.[0]
@@ -1352,17 +949,16 @@ function clearedMessage(message, text) {
 }
 
 // ---------------------------------------------------------------------------
-// 状态开关：{ enabled, mode: 'round' | 'overclock' }；旧文件只有 enabled 时按普通模式
+// 状态开关：{ enabled: boolean }
 // ---------------------------------------------------------------------------
 
 function defaultState() {
-  return { enabled: true, mode: MODE_ROUND }
+  return { enabled: true }
 }
 
 function normalizeState(parsed) {
   if (!parsed || typeof parsed !== 'object') return defaultState()
-  const mode = parsed.mode === MODE_OVERCLOCK ? MODE_OVERCLOCK : MODE_ROUND
-  return { enabled: parsed.enabled !== false, mode }
+  return { enabled: parsed.enabled !== false }
 }
 
 /** 进程内缓存：step/end 时机敏感，须同步读、先清除后 I/O。 */
@@ -1374,24 +970,6 @@ let stateCache = (() => {
   }
 })()
 
-/**
- * 同步读取状态文件。
- *
- * step/end 的清除是时序敏感的（必须在下一步组装 prompt 之前完成，不能 await），
- * 因此这里必须**直接读文件**：只要文件里是 overclock，逐步清除就按 overclock 走。
- * 只读内存缓存会与另一边 `readState()`（turn/end、turn/start 用）不一致——
- * 表现就是「overclock 打开后，逐步清除不生效，只有轮末才清除」：
- * 同步路径看到的是过期的 round，异步路径读到的是 overclock。
- * 读失败（文件暂不可读）时保留上一次已知状态，避免中途静默切换模式。
- */
-function readStateSync() {
-  try {
-    stateCache = normalizeState(JSON.parse(readFileSync(STATE_FILE, 'utf8')))
-  } catch {
-    // 保留 stateCache
-  }
-  return stateCache
-}
 
 async function readState() {
   try {
@@ -1457,4 +1035,120 @@ function projectKey(cwd) {
     }
   }
   return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
+}
+
+
+// ---------------------------------------------------------------------------
+// 占位符索引：让模型不必先取回就知道被清除的那一步里有什么。
+// 形如 `bash → git status（1.2k，失败）`；PTC（run_code）内部真正干活的子调用在事件流里
+// 看不到，所以在 tool/ptc-dispatch 里自己收一份。0.7.0 由 usage.mjs 内联而来——
+// 归因埋点、rare-token 判定与每轮 usage.json 落盘已全部删除。
+// ---------------------------------------------------------------------------
+
+const PTC_MAX_KEYS = 200
+/** sessionId -> Map<'turn:step', items[]>（登记顺序即 LRU） */
+const ptcBooks = new Map()
+
+function ptcBookOf(sessionId) {
+  let book = ptcBooks.get(sessionId)
+  if (!book) {
+    book = new Map()
+    ptcBooks.set(sessionId, book)
+  }
+  return book
+}
+
+function hintOfArgs(args) {
+  let value = args
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value)
+    } catch {
+      return String(args).replace(/\s+/g, ' ').trim().slice(0, 40)
+    }
+  }
+  if (value && typeof value === 'object') {
+    for (const field of ['command', 'file_path', 'path', 'pattern', 'query', 'description', 'prompt']) {
+      const raw = value[field]
+      if (typeof raw === 'string' && raw.trim() !== '') return raw.replace(/\s+/g, ' ').trim().slice(0, 40)
+    }
+  }
+  return ''
+}
+
+/** PTC 子调用登记：run_code 内部真正的 bash/read/…（事件流里看不到，所以在 hook 里自己收）。 */
+function recordPtcDispatch(sessionId, data) {
+  try {
+    const turn = data && data.turn
+    const step = data && data.step
+    if (typeof turn !== 'number' || typeof step !== 'number') return
+    const book = ptcBookOf(sessionId)
+    const key = turn + ':' + step
+    const list = book.get(key) || []
+    list.push({ tool: (data && data.name) || 'tool', hint: hintOfArgs(data && data.arguments), chars: 0, failed: false })
+    if (list.length > 8) list.splice(0, list.length - 8)
+    book.delete(key)
+    book.set(key, list)
+    while (book.size > PTC_MAX_KEYS) book.delete(book.keys().next().value)
+  } catch {
+    // 忽略
+  }
+}
+
+/** 取某一步登记过的 PTC 子调用（没有则空数组）。 */
+function ptcItems(sessionId, turn, step) {
+  try {
+    const book = ptcBooks.get(sessionId)
+    if (!book || typeof turn !== 'number' || typeof step !== 'number') return []
+    const list = book.get(turn + ':' + step)
+    return list ? list.map((item) => Object.assign({}, item)) : []
+  } catch {
+    return []
+  }
+}
+
+function shortText(value, limit) {
+  const text = String(value == null ? '' : value)
+  return text.length > limit ? text.slice(0, Math.max(1, limit - 1)) + '…' : text
+}
+
+/** 占位符里的一行索引；整行压到 60 字以内。 */
+function indexText(items) {
+  try {
+    const list = (items || []).filter(Boolean)
+    if (list.length === 0) return ''
+    const build = (hintLimit) => {
+      const parts = []
+      for (const item of list.slice(0, 2)) {
+        const name = shortText(item.tool, 12)
+        const hint = item.hint ? shortText(item.hint, hintLimit) : '无参数'
+        const chars = item.chars || 0
+        const size = chars > 0 ? (chars >= 1000 ? (chars / 1000).toFixed(1) + 'k' : String(chars)) : ''
+        const tail = [size, item.failed ? '失败' : ''].filter(Boolean).join('，')
+        parts.push(name + ' → ' + hint + (tail ? '（' + tail + '）' : ''))
+      }
+      if (list.length > 2) parts.push('等 ' + list.length + ' 条')
+      return parts.join(' + ')
+    }
+    let text = build(26)
+    if (text.length > 60) text = build(12)
+    if (text.length > 60) text = text.slice(0, 59) + '…'
+    return text
+  } catch {
+    return ''
+  }
+}
+
+function argsText(args) {
+  if (args == null) return ''
+  if (typeof args === 'string') return args
+  try {
+    return JSON.stringify(args)
+  } catch {
+    return String(args)
+  }
+}
+
+function callKeyOf(toolName, argsString) {
+  return String(toolName == null ? '?' : toolName) + '|' + String(argsString == null ? '' : argsString).replace(/\s+/g, ' ').trim().slice(0, 80)
 }

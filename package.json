@@ -1,8 +1,8 @@
 {
   "name": "dsh-clear-tool-results",
-  "version": "0.6.8",
+  "version": "0.7.0",
   "author": "stultuss",
-  "description": "DeepSeek Harness host plugin: archive raw tool results into the session folder, clear them from the visible conversation at round boundaries (or per-step in overclock mode), and let the model recall them through a read_tool_result_log(turn, step) tool.",
+  "description": "DeepSeek Harness host plugin: archive raw tool results into the session folder, clear them from the visible conversation at round boundaries, and let the model recall them through a read_tool_result_log tool.",
   "homepage": "https://github.com/stultuss/dsh-clear-tool-results#readme",
   "repository": {
     "type": "git",
@@ -23,23 +23,12 @@
   },
   "files": [
     "index.mjs",
-    "usage.mjs",
     "cordis.patch.yml",
-    "patches/patch-core.mjs",
-    "patches/check-harness-compat.mjs",
-    "patches/README.md",
-    "scripts/check-harness-compat.mjs",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
   ],
-  "scripts": {
-    "patch:status": "node patches/patch-core.mjs status",
-    "patch:where": "node patches/patch-core.mjs where",
-    "patch:apply": "node patches/patch-core.mjs apply",
-    "patch:revert": "node patches/patch-core.mjs revert",
-    "check:compat": "node patches/check-harness-compat.mjs --pack 0.1.2-rc.1 --pack 0.1.5-rc.1 --pack 0.1.5-rc.2"
-  },
+  "scripts": {},
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -47,8 +36,7 @@
     "plugin",
     "tool-result",
     "compaction",
-    "context",
-    "overclock"
+    "context"
   ],
   "license": "MIT"
 }
