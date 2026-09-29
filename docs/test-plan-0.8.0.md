@@ -239,14 +239,16 @@ dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "<固定 prompt>
 
 | # | 结果 |
 |---|---|
-| 3.1 产物边界 | ✅ `schemaVersion: 3` 只出现在 **2 个会话**，且都属于本项目（`session-522450ea` 7 条、`session-9cbc4b1f` 13 条）；其余 50 个全是 0.7.0 的 v2 |
+| 3.1 产物边界 | ✅ `schemaVersion: 3` 只出现在 **2 个会话**，且都属于本项目（`session-522450ea` 7 条、`session-9cbc4b1f` 19 条，后者随活体 ON 持续增长）；其余 50 个全是 0.7.0 的 v2 |
 | 3.2 legacy 回读 | ✅ **逐字节一致**：6 个会话 / 12 轮 / **75 条**，0 处不一致、0 个空轮。做法不依赖 live GUI——`apply(mock ctx)` 后直接调**真的** `read_tool_result_log.execute({turn})`，用 `persistence.locate` 把目录指向真实会话目录（真实目录零写入） |
-| 3.3 索引 ↔ 文件 | ✅ **100%**：52 个目录 / 20 条 v3 条目，`file` 缺失 **0** · `bytes` 不符 **0** · `lines` 不符 **0** · 孤儿 `.txt` **0**；213 个 `round-*.json` |
+| 3.3 索引 ↔ 文件 | ✅ **100%**：52 个目录 / 26 条 v3 条目（2026-09-29 15:27 活体 ON 后复核），`file` 缺失 **0** · `bytes` 不符 **0** · `lines` 不符 **0** · 孤儿 `.txt` **0**；213 个 `round-*.json` |
 | 3.5 噪音审计 | ✅ `$DSH_HOME/clear-tool-results.log` 共 **8 行**、最后写入 **2026-09-14**（0.7.0 trace 时代），**2026-09-28 起 0 行** ⇒ 0.8.x 正常路径零 warn I/O |
 | 3.4 阈值复核 | ✅ 见 §13.13（`.sandbox/evidence/2026-09-29/r-measure/`）：`R̄ = 705 B`、`p* = 75.5%`，与设计记录一致 |
 | 3.6 识别口径校准 | ✅ 行首锚定判据同时用于 `r-measure` 与 `l3`；收据与 `results/` 目录数自洽 |
 
 ⇒ **G3 通过**。**环境事实（会静默出错，务必记住）**：本机**没有 `rg`**（`command -v rg` 为空）⇒ `rg … | head` 返回空串、会被误读成「0 条」。文档命令已改用 `grep`，测量脚本改用 `tail -n` + `wc -l`。
+
+**2026-09-29 15:27 更新（第四次复核：活体 ON 后重跑 3.1 / 3.3 / 3.5）**：用户重启 GUI 后插件才真正进入 ON（PID `59794` → `64085`，副本 md5 `f7e1e1cb…` = 仓库 = 0.8.3），于是首次出现**活体自己写出来**的 v3 数据：v3 条目 26 条（`session-9cbc4b1f` 19 + `session-522450ea` 7），`file` 缺失 **0** · `bytes` 不符 **0** · `lines` 不符 **0** · 孤儿 `.txt` **0**；legacy 回读仍 6 会话 / 12 轮 / 75 条逐字节一致；告警日志 2026-09-28 起仍 **0 行**。⇒ **G3 在活体写入的数据上继续成立**。⚠️ 该脚本**不自写报告文件**，必须显式 `>` 重定向，否则读到上一次的旧报告（§13.18 假绿事故）。
 
 纪律：全部**只读**；会话日志用 `zstd -dc`（多帧）解压后落 `.sandbox/` 或 `/tmp`，**不入库**；含他项目源码/密钥的样本不外传、用完删。
 
@@ -257,7 +259,7 @@ dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "<固定 prompt>
 | 4.1 | 幂等重装 | `npm pack` → `dsh plugin --profile web add <tgz>` | 成功，无 `duplicate loader entry id` |
 | 4.2 | 单条目 | `dsh --profile web --dump-config \| grep -n -B2 -A2 'clear-tool-results'` | **恰好一条** entry，来自 bundle 层 |
 | 4.3 | 残留文件审计 | profile 下 `cordis.patch.yml.bak-20260928-134448`、`cordis.patch.yml.dup-135322` | 文件名不匹配加载名 ⇒ 断言**未被加载**；是否清理见 §13 |
-| 4.4 | 三态实测 | 真实 GUI 里 `on`/`off`/`status`；OFF 时用 >1024 B 的 `web_fetch` 验证原样，ON 时验证收据化 | 行为与文案一致 |
+| 4.4 | 三态实测 | 真实 GUI 里 `on`/`off`/`status`；OFF 时用 >1024 B 的 `web_fetch` 验证原样，ON 时验证收据化 | **`off` 侧（2026-09-29 15:07）与 `on` 侧（2026-09-29 15:24，重启后副本 md5 `f7e1e1cb…`）均已实测通过；`status` 文案仍未在活体跑过**（ON 侧证据：§5 第四次复核、§13.17、`.sandbox/evidence/2026-09-29/live-0.8.3/`） |
 | 4.5 | 禁用态工具注册 | ✅ **真实环境已验（2026-09-29）**：OFF 态下真实调用 `read_tool_result_log`（无参）返回 15 条归档清单，未被收据化 ⇒ 仍注册且可用 |
 | 4.6 | 副本一致性 | `md5 -q` 比对仓库 / 已装副本 | 相同；改代码后必须重装，否则「测 A 跑 B」 |
 | 4.7 | 卸载 | README §卸载 三步 | dump-config 无条目、工具消失、状态文件保留但无效 |
@@ -365,19 +367,21 @@ dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "<固定 prompt>
 14. **【已修·2026-09-29】B5 单行超预算预览 → 预览硬上限**（0.8.2）：`takeLines` 首行超预算时改按码点裁切（`clipLine`），并新增 `saveResult` 护栏「收据不比原文短就不落盘」。实测影响 10/1,238 条（0.8%），修复前这 10 条全部产出「收据 ≥ 原文」（合计多 +4.1 KB，单条最多 +437 B），修复后 `R ≥ S` 为 0。
 15. **【已修·2026-09-29】清单模式头行报错尺寸 → 0.8.3**：`renderRetrieval` 从 `entry.text` 推行数/字节，而清单模式的 `text` 是**单行占位串**，于是头行报「第 1-1 行 / 共 1 行 · 55 字节」，与该条真实尺寸自相矛盾。修法：清单条目自带真实 `bytes`/`lines`，头行优先报它并去掉行窗声明；轮次模式格式不变。发现途径是真实环境 OFF 态验证时读清单输出（`.sandbox/evidence/2026-09-29/l4/README.md`）。新增 `D1b`/`D1c` 两条断言。
 16. **【新增·2026-09-29】**spill 内层重复落盘（>50000 B 结果被 `dsh-spill-policy` 与本插件各存一份）。已知冗余，未处理；要不要在收据里额外给出 spill 路径或干脆接受，待定。
+17. **【已测·2026-09-29】活体 ON 侧端到端 + 真实检索率首测**：用户重启 GUI 后（PID `59794` → `64085`，副本 md5 `f7e1e1cb…` = 仓库 = 0.8.3），`stateCache` 在模块加载时同步读状态文件（`index.mjs:643-649`）⇒ 重启即 ON（此前 `stateCache` 被 `/clear-tool-results off` 冻结在 `false`，这是拿不到 ON 侧活体数据的真正原因）。实测：2,590 B `bash` → 收据（头 + 路径 + 指引 + 尾部 8 行）；归档文件 **2,590 B 与收据声明逐字节相同**；`read_tool_result_log(turn:25, step:5, limit:8)` 精确取回并给出续取提示；索引 `results` 键（不是 `entries`）条目递增。同日跑出**首个真实检索率**：`.sandbox/evidence/2026-09-29/l2/live-retrieval-rate.mjs --all` 扫 52 会话 / 26 条 v3 收据，`p̂ ∈ [36.0%, 68.0%]`（严格/宽松），同批 `p* = 73.8%` ⇒ 两个界都在判定线下。**但样本全部来自本项目开发与测试会话（其余 50 个 v2 目录 0 条）**，故 G2 仍不判定。
+18. **【纪律·2026-09-29】"stale report.txt" 类假绿**：`l3/consistency.mjs` 只往 stdout 打印、不自写文件；本次用 `| tail` 跑它却去读上一小时的 `report.txt`，读到**重启前的 20 条**并差点当成新结论。教训与 `rg` 那次同源——**脚本不自写文件时必须显式重定向**，读证据前先核对 `stat` 的 mtime。已在 `.sandbox/evidence/2026-09-29/l3/README.md` 注明。
 
 ## 14. 执行状态回填（截至 2026-09-29）
 
 | 门 | 状态 |
 |---|---|
 | G1 L1 | **通过（2026-09-29）**——`test/` 已入库，`npm test` **87/87** 全绿（B5 已在 0.8.2 修掉，其余 §3.8 已知项按"记行为"处理） |
-| G2 L2 取回率 | **未判定**——真实收据 0 条；口径已补 A3 盲区（§4.4） |
+| G2 L2 取回率 | **仍未判定（但已可测）**——活体 ON 后才有真实收据：52 会话中仅 2 个 v3 会话有归档（26 条，全在本项目），机械测出 `p̂ ∈ [36.0%, 68.0%]`、同批 `p* = 73.8%`、`S = 123,660 B`、一次注入净省 106,035 B ⇒ **两个界都在判定线以下，样本内过滤净赚**；但样本是开发/测试会话，不代表真实工作负载 ⇒ 不判定。真实 `p̂` 待日常使用累积后用 `l2/live-retrieval-rate.mjs --all` 重跑（§4.4 口径 + A3 盲区仍适用） |
 | G3 L3 | **通过（2026-09-29）**——3.1/3.2/3.3/3.4/3.5/3.6 全部跑完：索引↔文件一致性 100%（0 缺失 / 0 bytes 不符 / 0 lines 不符 / 0 孤儿）、legacy 回读逐字节一致（75 条 0 处）、0.8.x 告警日志零新增（§5 第三行表） |
-| G4 L4 | **部分（2026-09-29 重装 0.8.2 并重启后；`off` 侧已实测）**——4.1 幂等重装 ✅、4.2 单条目 ✅（dump-config 548 行 / `clear-tool-results-host` 恰好 1 次，来自 bundle 层）、4.3 残留审计 ✅（`cordis.patch.yml` = `[]`）、4.6 副本一致性 ✅（仓库 = 已装副本 = `71582992…`）；**4.4 的 `off` 侧与 4.5 已实测（用户执行 `/clear-tool-results off` 后：状态文件翻 `false`、1,100 B 结果原样进上下文无收据、归档不增、工具仍可用）；`on`/`status` 待补齐**。活体判据：单行 1,600 B 结果被裁到 300 B 且收据写「该行过长」（0.8.1 会整行返回），落盘文件 1,600 B 保真。证据 `.sandbox/evidence/2026-09-29/l4/` |
+| G4 L4 | **部分（`off` 侧 + `on` 侧均已实测；`status` 待补）**——4.1 幂等重装 ✅、4.2 单条目 ✅（dump-config 548 行 / `clear-tool-results-host` 恰好 1 次，来自 bundle 层）、4.3 残留审计 ✅（`cordis.patch.yml` = `[]`）、4.6 副本一致性 ✅（**0.8.3：仓库 = 已装副本 = `f7e1e1cb…`**；0.8.2 的 `71582992…` 已作废）；**4.4 的 `off` 侧与 4.5 已实测（用户执行 `/clear-tool-results off` 后：状态文件翻 `false`、1,100 B 结果原样进上下文无收据、归档不增、工具仍可用）；`on` 侧亦已实测（2026-09-29 15:24 重启后：2,590 B `bash` 被收据化、归档逐字节保真、`read_tool_result_log` 取回成功、v3 索引条目递增），`status` 文案待补齐**。活体判据：单行 1,600 B 结果被裁到 300 B 且收据写「该行过长」（0.8.1 会整行返回），落盘文件 1,600 B 保真。证据 `.sandbox/evidence/2026-09-29/l4/`、`.sandbox/evidence/2026-09-29/live-0.8.3/` |
 | G5 L5 | **通过（2026-09-29）**——5.1/5.2/5.3/5.4/5.6/5.7 均有确定结论并已固化为 8 条断言；仅 5.5（compaction pruner）因本机够不到 800k 阈值而未观测 |
 | G6 L6 | **部分**——10 个失败/并发场景已由 L1 覆盖（`l6-failures`）；真实环境：warning 日志审计**已做**（§5 三次复盘的 3.5：0.8.x 起 0 行）、**6.7 游标时序已测（错位 0/22）**；仍欠真实环境下的**失败注入**（需 headless 沙箱） |
 
-**可用的只读证据**：`.sandbox/evidence/2026-09-28/p-scan/`（取回率与 `read` 反事实）、`.sandbox/evidence/2026-09-28/l3/`（首次 0.8.0 触发复盘）、`.sandbox/evidence/2026-09-29/r-measure/`（`R` 实测 + `p*` + 阈值扫描 + 修复前影响）、`.sandbox/evidence/2026-09-29/l3/`（索引一致性 + legacy 回读 + 噪音审计）、`.sandbox/evidence/2026-09-29/l4/`（安装面与活体判据）、`.sandbox/evidence/2026-09-29/l5/`（宿主依赖身份校验）、`.sandbox/evidence/2026-09-29/l6/`（游标时序）。
+**可用的只读证据**：`.sandbox/evidence/2026-09-28/p-scan/`（取回率与 `read` 反事实）、`.sandbox/evidence/2026-09-28/l3/`（首次 0.8.0 触发复盘）、`.sandbox/evidence/2026-09-29/r-measure/`（`R` 实测 + `p*` + 阈值扫描 + 修复前影响）、`.sandbox/evidence/2026-09-29/l3/`（索引一致性 + legacy 回读 + 噪音审计）、`.sandbox/evidence/2026-09-29/l4/`（安装面与活体判据）、`.sandbox/evidence/2026-09-29/l5/`（宿主依赖身份校验）、`.sandbox/evidence/2026-09-29/l6/`（游标时序）、`.sandbox/evidence/2026-09-29/l2/`（真实检索率扫描 + 双口径 `p̂`）、`.sandbox/evidence/2026-09-29/live-0.8.3/`（活体 ON 侧端到端实测）。
 
 ## 附录 A 命令速查
 
@@ -397,6 +401,12 @@ dsh --profile web --dump-config | grep -n -B2 -A2 'clear-tool-results'
 
 # R 与 p*（只读，真 receiptText）
 node .sandbox/evidence/2026-09-29/r-measure/measure.mjs
+
+# L2 真实检索率（活体 ON 后随时重跑；脚本自写报告，无需重定向）
+node .sandbox/evidence/2026-09-29/l2/live-retrieval-rate.mjs --all .sandbox/evidence/2026-09-29/l2/report.txt
+
+# L3 一致性（注意：该脚本只打印 stdout，必须显式重定向，否则读到上次的旧报告）
+node .sandbox/evidence/2026-09-29/l3/consistency.mjs > .sandbox/evidence/2026-09-29/l3/report.txt 2>&1
 
 # 日志纪律（禁止整读 .log）
 tail -n 50 ~/.dsh/clear-tool-results.log
