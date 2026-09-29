@@ -81,15 +81,88 @@ test('A5 含非 text block：原样且不落盘', async (t) => {
   assert.equal(findIndexes(env.home).length, 0)
 })
 
-test('A6/A7 read 与 read_tool_result_log 豁免', async (t) => {
+test('A6 read_tool_result_log 完全豁免（按名字）', async (t) => {
   const env = await boot(t)
-  const s = session()
   const big = 'x'.repeat(200_000)
-  for (const name of ['read', 'read_tool_result_log']) {
+  const decision = acceptOf(textResult(big).content)
+  const out = await post(env, execOf({ name: 'read_tool_result_log', agent: { session: session() } }), textResult(big), decision)
+  assert.equal(out, decision, '取回通道本身必须原样放行')
+  assert.equal(findIndexes(env.home).length, 0)
+})
+
+test('A7 read 不再全豁免：读普通大文件 → 收据化 + 落盘（0.8.6）', async (t) => {
+  const env = await boot(t)
+  const s = session('session-test', '/tmp/proj')
+  const big = overThreshold(200_000)
+  const decision = acceptOf(textResult(big).content)
+  const exec = execOf({ name: 'read', arguments: { file_path: '/tmp/proj/src/big.ts' }, agent: { session: s } })
+  const out = await post(env, exec, textResult(big), decision)
+  assert.ok(isReceipt(out), '首次读大文件应被收据化')
+  assert.equal(findIndexes(env.home).length, 1)
+  const [file] = findResults(env.home)
+  assert.equal(readFileSync(file, 'utf8'), big, '落盘必须是原文')
+})
+
+test('A7b read 读任何会话的 tool-result-logs 归档 → 豁免（取回通道）', async (t) => {
+  const env = await boot(t)
+  const s = session('session-test', '/tmp/proj')
+  const big = overThreshold(200_000)
+  const paths = [
+    '/tmp/proj/tool-result-logs/results/t0001-s0001-01-bash-call_x.txt', // 本会话布局
+    '/Users/someone/.dsh/sessions/--other-proj--/session-abc/tool-result-logs/index.json', // 别的会话
+    '/tmp/proj/tool-result-logs/round-0001.json', // legacy 轮文件
+  ]
+  for (const filePath of paths) {
     const decision = acceptOf(textResult(big).content)
-    const out = await post(env, execOf({ name, agent: { session: s } }), textResult(big), decision)
-    assert.equal(out, decision, `${name} 必须原样放行`)
+    const exec = execOf({ name: 'read', arguments: { file_path: filePath }, agent: { session: s } })
+    const out = await post(env, exec, textResult(big), decision)
+    assert.equal(out, decision, `${filePath} 必须原样放行`)
   }
+  assert.equal(findIndexes(env.home).length, 0)
+})
+
+test('A7c read 同一路径第二次起放行（重复读 = 真的需要）', async (t) => {
+  const env = await boot(t)
+  const s = session('session-test', '/tmp/proj')
+  const big = overThreshold(200_000)
+  const exec = () => execOf({ name: 'read', arguments: { file_path: '/tmp/proj/src/big.ts' }, agent: { session: s } })
+  const first = await post(env, exec(), textResult(big), acceptOf(textResult(big).content))
+  assert.ok(isReceipt(first), '第一次收据化')
+  assert.equal(findIndexes(env.home).length, 1)
+  const second = acceptOf(textResult(big).content)
+  const out = await post(env, exec(), textResult(big), second)
+  assert.equal(out, second, '第二次原样放行（不新增归档、不再多要一轮）')
+  assert.equal(findIndexes(env.home).length, 1, '没有第二条归档')
+})
+
+test('A7d read 的"第二次起放行"按会话隔离，且相对路径按 cwd 解析', async (t) => {
+  const env = await boot(t)
+  const a = session('session-a', '/tmp/projA')
+  const b = session('session-b', '/tmp/projB')
+  const big = overThreshold(200_000)
+  const read = (s, p) => post(env, execOf({ name: 'read', arguments: { file_path: p }, agent: { session: s } }), textResult(big), acceptOf(textResult(big).content))
+  assert.ok(isReceipt(await read(a, 'src/big.ts')), 'A 会话首次（相对路径）收据化')
+  assert.ok(isReceipt(await read(b, 'src/big.ts')), 'B 会话是**另一个**会话，仍算首次')
+  // 注意：要断言"原样透传"必须自己持有那个 decision 对象——read() 内部会新建一个。
+  const third = acceptOf(textResult(big).content)
+  const out = await post(env, execOf({ name: 'read', arguments: { file_path: '/tmp/projA/src/big.ts' }, agent: { session: a } }), textResult(big), third)
+  assert.equal(out, third, 'A 会话同一文件的绝对路径写法也应命中"已收据化"')
+})
+
+test('A7e read 取不到路径（无 file_path）：按普通工具规则收据化', async (t) => {
+  const env = await boot(t)
+  const big = overThreshold(200_000)
+  const decision = acceptOf(textResult(big).content)
+  const out = await post(env, execOf({ name: 'read', arguments: {}, agent: { session: session() } }), textResult(big), decision)
+  assert.ok(isReceipt(out), '没有路径就无法判定为归档读取，按普通工具处理')
+})
+
+test('A7f read 小文件（≤阈值）：放行且不落盘', async (t) => {
+  const env = await boot(t)
+  const small = 'x'.repeat(INLINE_MAX_BYTES)
+  const decision = acceptOf(textResult(small).content)
+  const out = await post(env, execOf({ name: 'read', arguments: { file_path: '/tmp/proj/small.ts' }, agent: { session: session() } }), textResult(small), decision)
+  assert.equal(out, decision)
   assert.equal(findIndexes(env.home).length, 0)
 })
 

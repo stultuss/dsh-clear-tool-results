@@ -28,7 +28,8 @@ test('F2 status 的版本号来自同目录 package.json', async (t) => {
   const st = await cmd(env).handler({ rawInput: 'status' })
   assert.ok(st.text.includes(`插件版本：${pkg.version}`), st.text)
   assert.match(st.text, new RegExp(`准入阈值：${INLINE_MAX_BYTES} 字节`))
-  assert.match(st.text, /豁免工具：read、read_tool_result_log/)
+  assert.match(st.text, /豁免工具：read_tool_result_log/)
+  assert.match(st.text, /read 规则：读任何会话的 tool-result-logs\/ 归档 → 豁免/)
 })
 
 test('F3 状态文件缺失：默认 enabled: true', async (t) => {

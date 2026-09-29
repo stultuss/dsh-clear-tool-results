@@ -31,7 +31,7 @@
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises'
 import { appendFileSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 
 /** 取回工具的参数归一化：只把纯数字字符串的 turn/step 变成数字，其余原样透传。 */
 function normalizeReadArgs(input) {
@@ -84,10 +84,61 @@ const RENDER_BUDGET_BYTES = 48000
 const TAIL_PREVIEW_TOOLS = new Set(['bash', 'run_code'])
 
 /**
- * 豁免工具：内容就是下一步的必需输入（`read`），或本身就是取回通道
- * （`read_tool_result_log`）——裁剪它们会造成 read → 收据 → read 的循环。
+ * **按名字**完全豁免的工具。注意 `read` **不在这里**——它的准入按**路径**判定（见 `onPostExecute`，
+ * 2026-09-29/0.8.6 起）：`read` 是收据指定的取回通道，但它同时是上下文里最大的字节来源
+ * （实测占 25.6%），全豁免等于把最大的一块留在外面。新规则：
+ *   ① 读**任何会话**的 `tool-result-logs/` 下的归档 → 豁免（这正是收据指的那条路，死锁由此解开；
+ *      跨会话也豁免，因为审计别的会话的归档同样是"取回归档"而不是"新读一份源文件"）；
+ *   ② 同一路径**第二次起** → 原样放行（重复读 = 真的需要，不必再让它多跑一轮）；
+ *   ③ 其余 `read`（首次读某个大文件）→ 与普通工具同规则。
  */
-const EXEMPT_TOOLS = new Set(['read', 'read_tool_result_log'])
+const EXEMPT_TOOLS = new Set(['read_tool_result_log'])
+const READ_TOOL = 'read'
+/** 已产出过收据的 `read` 路径（`sessionId\0绝对路径`）：命中即"第二次起"，放行。 */
+const receiptedReads = new Set()
+/** 上限只为兜住长跑进程的内存；淘汰最旧的条目只会让某次重复读再收据化一次，无正确性影响。 */
+const RECEIPTED_READS_MAX = 2000
+/** 进程内、跨重启即忘——重启后某次重复读会再收据化一次，代价一轮，可接受。 */
+const readKey = (session, path) => `${session.header?.id ?? session.id ?? ''}\u0000${path}`
+
+/**
+ * 该路径是否落在某个会话的归档目录里（判据：路径**段**中出现 `tool-result-logs`）。
+ * 用路径段而不是前缀比较，是为了同时覆盖本会话与其他会话、以及 `persistence.locate` 指定的自定义 root。
+ */
+function isArchivePath(path) {
+  try {
+    return resolve(path).split(sep).includes(LOG_DIR_NAME)
+  } catch {
+    return false
+  }
+}
+
+/** `read` 的目标绝对路径（相对路径按会话 cwd 解析）；取不到路径时返回 null（按普通工具处理）。 */
+function readTargetOf(exec, session) {
+  let args = exec.arguments
+  if (typeof args === 'string') {
+    try {
+      args = JSON.parse(args)
+    } catch {
+      return null
+    }
+  }
+  const value = args?.file_path ?? args?.path
+  if (typeof value !== 'string' || value.trim() === '') return null
+  try {
+    return resolve(session.header?.cwd ?? '', value.trim())
+  } catch {
+    return null
+  }
+}
+
+function rememberReceiptedRead(session, path) {
+  receiptedReads.add(readKey(session, path))
+  if (receiptedReads.size > RECEIPTED_READS_MAX) {
+    const oldest = receiptedReads.values().next().value
+    if (oldest !== undefined) receiptedReads.delete(oldest)
+  }
+}
 
 const byteLen = (text) => Buffer.byteLength(String(text ?? ''), 'utf8')
 
@@ -134,6 +185,7 @@ export function apply(ctx) {
             state.enabled ? '当前状态：已启用（准入过滤）' : '当前状态：已禁用',
             `准入阈值：${INLINE_MAX_BYTES} 字节`,
             `豁免工具：${[...EXEMPT_TOOLS].join('、')}`,
+            `read 规则：读任何会话的 ${LOG_DIR_NAME}/ 归档 → 豁免；同一路径第二次起 → 放行；其余首次读大文件 → 按阈值收据化`,
             `插件版本：${PLUGIN_VERSION}`,
           ].join('\n'),
         }
@@ -262,10 +314,18 @@ async function onPostExecute(ctx, exec, result, next) {
     if (!stateCache.enabled) return decision
     if (!decision || decision.kind !== 'accept' || Object.hasOwn(decision, 'value')) return decision
     if (exec.parent !== undefined) return decision // PTC 子调用不进模型上下文
-    if (EXEMPT_TOOLS.has(exec.name)) return decision
     if (result?.isError === true) return decision // 失败结果不裁剪：报错内容是排障必需
     const session = exec.agent?.session
     if (!session) return decision
+    // `read` 按**路径**判定（其余工具按名字）：
+    //   ① 读任何会话的 tool-result-logs 归档 → 豁免（收据指定的取回通道，跨会话也豁免）
+    //   ② 同一路径第二次起 → 放行（重复读 = 真的需要，别再让它多跑一轮）
+    //   ③ 其余 read（首次读某个大文件）→ 与普通工具同规则
+    const readPath = exec.name === READ_TOOL ? readTargetOf(exec, session) : null
+    if (readPath !== null) {
+      if (isArchivePath(readPath)) return decision
+      if (receiptedReads.has(readKey(session, readPath))) return decision
+    } else if (EXEMPT_TOOLS.has(exec.name)) return decision
     // 始终用**原始结果**（result.content）判定与落盘，而不是 decision.content：
     // 同一条瀑布上还有别的监听者（如 spill-policy）可能已经改写过模型可见内容。
     const text = flattenPlainText(result.content)
@@ -275,6 +335,7 @@ async function onPostExecute(ctx, exec, result, next) {
     const logsDir = logsDirOf(ctx, session)
     const entry = await saveResult(ctx, session, logsDir, exec, text, bytes)
     if (!entry) return decision // 落盘失败 → 保持原样（绝不把成功调用变成错误）
+    if (readPath !== null) rememberReceiptedRead(session, readPath)
     const content = [{ type: 'text', text: receiptText(entry, text) }]
     return decision.additionalContexts ? { kind: 'accept', content, additionalContexts: decision.additionalContexts } : { kind: 'accept', content }
   } catch (error) {

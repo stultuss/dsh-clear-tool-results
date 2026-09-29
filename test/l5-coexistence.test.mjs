@@ -112,13 +112,31 @@ test('5.6 PTC：内层子调用不落盘，外层落盘', async (t) => {
   assert.equal(findResults(env.home).length, 1)
 })
 
-test('5.4 read 双豁免：超大结果原样透传（不落盘、不加 content）', async (t) => {
+test('5.4 read 读归档仍豁免：超大结果原样透传（不落盘、不加 content）', async (t) => {
   const env = await boot(t)
   const s = session()
-  const exec = execOf({ name: 'read', callId: 'call_l5_g', agent: { session: s } })
+  const exec = execOf({
+    name: 'read',
+    callId: 'call_l5_g',
+    arguments: { file_path: '/tmp/proj/tool-result-logs/results/t0001-s0001-01-bash-call_x.txt' },
+    agent: { session: s },
+  })
   const decision = await runPostExecute(env, exec, textResult(L(200000, 'z')))
-  assert.ok(!Object.hasOwn(decision, 'content'), '没有任何监听者改写 ⇒ 宿主保留原始 content')
+  assert.ok(!Object.hasOwn(decision, 'content'), '归档读取没有任何监听者改写 ⇒ 宿主保留原始 content')
   assert.equal(findResults(env.home).length, 0)
+})
+
+test('5.4b read 读普通大文件：本插件（最外层）收据化，压过内层 spill 预览', async (t) => {
+  const env = await boot(t)
+  addListener(env, spillLike('SPILL-PREVIEW-ONLY'))
+  const s = session()
+  const original = bigText(1000)
+  const exec = execOf({ name: 'read', callId: 'call_l5_g2', arguments: { file_path: '/tmp/proj/src/big.ts' }, agent: { session: s } })
+  const decision = await runPostExecute(env, exec, textResult(original))
+  assert.match(visibleText(decision), /全文已落盘/)
+  assert.ok(!visibleText(decision).includes('SPILL-PREVIEW-ONLY'), '内层预览被丢弃')
+  const [file] = findResults(env.home)
+  assert.equal(readFileSync(file, 'utf8'), original, '落盘的是 read 的原文')
 })
 
 test('5.7 内层 listener 合并 additionalContexts（repeat-tool-reminder 形状）后仍被保留', async (t) => {
