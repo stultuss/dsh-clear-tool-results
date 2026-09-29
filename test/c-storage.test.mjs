@@ -168,27 +168,23 @@ test('C12b get 抛错时回退默认布局', async (t) => {
   assert.ok(idx.results[0].file.includes(join('sessions', '--tmp-proj--', 'session-test', 'tool-result-logs', 'results')), idx.results[0].file)
 })
 
-test('C13 阈值 8192 下「收据不更短就不落盘」护栏不可达（算术事实；护栏保留为安全网）', async (t) => {
-  // 收据的可变部分只有 hint(≤60) + 路径 + 预览(≤300) + 固定约 219 ⇒ R 上限约 1.6 KB。
-  // 阈值升到 8192 后 R 不可能追上 S，因此护栏的 `return null` 分支在真实路径上不再可达
-  // （0.8.2 的 1024 阈值下它是可达的，本用例原先正是在这里断言"原样透传"）。
-  // 改为断言仍然成立、且更要紧的那条性质：**收据恒短于原文**（test-plan §3.8 记该分支为已记录未覆盖）。
+test('C13 收据不短于原文时不落盘、原样放行（永不把上下文变大）', async (t) => {
+  // 只有超长 DSH_HOME + 超长 cwd（projectKey 上限 251）才会让收据长过**刚过阈值**的原文：
+  // 路径 ≳630 B，加上头/指引/预览 ⇒ R ≈ 1.06 KB > 1,025 B。
+  // ⚠️ 该护栏的**可达性依赖阈值**：1024 下可达（本用例）；8192 下 R 上限约 1.6 KB 追不上原文，
+  //    分支不可达（曾因此在 0.8.4 里改写过本用例，0.8.5 回退阈值后恢复）。
   const home = join(tempHome(), 'h'.repeat(200))
   const env = await boot(t, { home })
   const text = 'q'.repeat(INLINE_MAX_BYTES + 1)
   const inner = acceptOf(textResult(text).content)
   const exec = execOf({ name: 'bash', callId: 'call_c13', agent: { session: session('session-test', '/' + 'x'.repeat(400)) } })
   const decision = await post(env, exec, textResult(text), inner)
-  assert.notEqual(decision, inner, '超阈值 ⇒ 收据化（不再是护栏放行）')
-  assert.ok(
-    Buffer.byteLength(decision.content[0].text, 'utf8') < Buffer.byteLength(text, 'utf8'),
-    '收据必须短于原文',
-  )
-  assert.equal(findResults(env.home).length, 1, '正常落盘')
-  assert.deepEqual(env.warns, [], '无落盘失败')
+  assert.equal(decision, inner, '原样透传 next() 的 decision')
+  assert.equal(findResults(env.home).length, 0, '不落盘')
+  assert.deepEqual(env.warns, [], '不是落盘失败，而是主动放弃')
 })
 
-test('C13b 原文更长时正常收据化（护栏只挡「收据更长」）', async (t) => {
+test('C13b 同一环境下原文更长时仍正常收据化（护栏只挡「收据更长」）', async (t) => {
   const home = join(tempHome(), 'h'.repeat(200))
   const env = await boot(t, { home })
   const text = 'q'.repeat(INLINE_MAX_BYTES + 4096)
