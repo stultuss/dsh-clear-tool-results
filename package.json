@@ -1,8 +1,8 @@
 {
   "name": "dsh-clear-tool-results",
-  "version": "0.7.0",
+  "version": "0.8.2",
   "author": "stultuss",
-  "description": "DeepSeek Harness host plugin: archive raw tool results into the session folder, clear them from the visible conversation at round boundaries, and let the model recall them through a read_tool_result_log tool.",
+  "description": "DeepSeek Harness host plugin: admission-filter tool results before they enter the context — oversized plain-text results are persisted to the session folder and the model receives a receipt with an absolute path, retrievable with the built-in read/grep tools.",
   "homepage": "https://github.com/stultuss/dsh-clear-tool-results#readme",
   "repository": {
     "type": "git",
@@ -28,7 +28,9 @@
     "LICENSE",
     "CHANGELOG.md"
   ],
-  "scripts": {},
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
   "keywords": [
     "dsh",
     "deepseek-harness",

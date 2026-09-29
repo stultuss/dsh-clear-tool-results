@@ -2,6 +2,49 @@
 
 本项目自 0.3.0 起遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（SemVer）。此处只记录版本之间的行为差异。
 
+## [0.8.2] - 2026-09-29
+
+### Fixed
+- **单行超预算时预览整行返回**：`takeLines` 的 `picked.length > 0` 守卫使「首行就超预算」的结果把**整行**当作预览——对单行大结果（压缩 JSON、base64、长单行）收据会等于甚至长于原文。现在改为按码点裁到字节预算内（`clipLine`），预览成为**硬上限**。
+- **收益护栏**：`saveResult` 在落盘前先算收据；收据不比原文更短时**不落盘、原样放行**（只有超长 cwd / `DSH_HOME` 才会触发）。准入过滤从此**永不把上下文变大**，且不留下无人知道的孤儿归档。
+
+### Added
+- `test/l5-coexistence.test.mjs`：把宿主 waterfall 语义固化成回归断言（见下）。
+
+### Verified
+- **确定性测试 85/85**（原 73 + L5 共存 8 + 收据边界 4）；`npm test`。
+- **L5 监听顺序已定论**（读宿主源码，并在**编译产物** `cordis/lib/index.js` 与 `dsh-tools/lib/index.js` 上复核；已证与活体加载的是同一文件）：cordis `EventsService.waterfall` 按注册数组顺序执行，**数组头 = 最外层**，`register()` 用 `prepend ? 'unshift' : 'push'`；`dsh-tools` 的 `postExecute` 把**同一个 `result` 对象**交给每个监听器，只用最外层活下来的 `decision.content` 覆盖结果。本插件用 `{prepend:true}` ⇒ 最外层；`dsh-spill-policy`(:155)、`dsh-tool-fs-search`(:848/:1159)、`dsh-repeat-tool-reminder`(:1495) 均不带选项 ⇒ 内层。因此：本插件永远读到**原始** `result.content`（与顺序无关），且收据覆盖掉 spill 的预览；代价是 >50000 字节结果会被 spill 内层**重复落一份**（观测项，未处理）。
+- **R 实测**（真 `receiptText`，本机 80 会话 / 3,582 条原始结果 / 1,238 条触发）：`R̄ = 705 B`（头行 131 + 路径行 203 + 指引行 88 + 正文 279），`R` 上限 **827 B**，`R ≥ S` **0 条**；`p* = 75.5%`，与设计记录 75.6% 一致。修复前的确切影响：1,238 条中 10 条（0.8%）会产出「收据 ≥ 原文」，合计多 +4.1 KB，单条最多 +437 B。
+- **阈值扫描**（预览 300）：`p*` = 75.5 / 79.2 / 82.0 / 85.7 / 87.9%（阈值 1024 / 1536 / 2048 / 3072 / 4096），字节覆盖 93.1% → 68.8%。净省：`p ≤ 0.2` 时 1024 最优；`p = 0.3` 时各档几乎相同（3,395 / 3,411 / 3,356 KB）；`p ≥ 0.5` 时 2048 领先约 8%。⇒ **维持 1024**，把选择留给真实取回率。
+- **R 瘦身评估（否决）**：把 88 字节的指引行完全删掉只让 `p*` 从 75.5% 升到 77.0%——不值得牺牲「怎么取回」这一要素。
+
+## [0.8.1] - 2026-09-28
+
+### Changed（破坏性：机制换位置，不是换参数）
+- **从「轮末清除」改为「产出时准入过滤」**：不再监听 `turn/end` / `turn/start` 改写已发送的 `tool/result`，改为在 `tools/post-execute` 上决定工具结果进入上下文的形态。超阈值结果**从未进入上下文** ⇒ 不再有轮边界的缓存前缀重建，也**不再需要任何核心补丁**。
+- **阈值替换**：`INLINE_MAX_BYTES = 1024`（预览 `PREVIEW_BYTES = 300`）取代 `ARCHIVE_MAX_BYTES = 49000`。1024 按 2026-09-28 复算选定（本机 2,781 条可过滤原始结果）：收据化 **43.9%** 的调用、覆盖 **93.6%** 的工具结果字节（4096 时 15.1% / 69.5%），净省字节 +35%；代价是平衡取回率 `p*` 由 81.0% 降到 75.6%。预览必须同步从 1200 降到 300——否则 1,024–1,500 字节档「收据 + 预览」比原文更长（占收据化条数 22.9%，降到 300 后为 0.2%）。
+- `read_tool_result_log` 保留，数据源改为准入端落盘的结果；**恢复 `step` 参数**（0.7.0 曾移除），并在工具描述里写明 `offset`/`limit` 是「对**每条**结果各自生效」。
+
+### Removed（破坏性）
+- 轮末/轮首清除路径：`clearToolResultsWhere`、`clearCompletedToolResults`、`clearedText`、`describeClearedResult`，以及 `turn/end` / `turn/start` 的清除时机逻辑。
+- surface 改写辅助与跨代兼容：`replaceToolResult`、`clearedMessage`、`preferredOpKeys`、`buildSurfaceOp`、`OP_KEYS_LEGACY` / `OP_KEYS_SEQ` 及「被拒则换另一代键名重试」；`eventsOf()` 不再需要。
+- `ARCHIVE_MAX_BYTES = 49000` 归档上限及其占位符文案（「超过上限，未归档，请重新执行原工具」）。落盘是插件自己写文件，不再受 harness spill 的 50000 字节截断影响——**0.7.0 的 `(49000, 50000]` 永久取不回断层随之消失**；`(48000, 49000]` 的分段缝也不再存在。
+
+### Added
+- **`tools/post-execute` 准入过滤**（`{ prepend: true }`）：`await next()` 后判定是否替换模型可见内容。判定与落盘一律使用**原始 `result.content`**（不是 `decision.content`）——同一条瀑布上 `spill-policy` 等监听者可能已改写过模型可见内容，用原始内容才能保证落盘的是完整原文。
+- **落盘**：`tool-result-logs/results/t<TTTT>-s<SSSS>-<NN>-<tool>-<callId>.txt`（**纯文本**，供 `read` 分页 / `grep` 检索）+ `index.json`（schemaVersion **3**，`results[]` 含 turn/step/tool/hint/bytes/lines/file）；幂等，同一 `callId` 只落一份。
+- **收据**：`[工具 · 参数摘要 · N 字节 / M 行 → 全文已落盘，此处是尾部/开头 K 行]` + **绝对路径** + 取全文提示；预览 300 字节（`bash`/`run_code` 取尾部，其余取开头）。**刻意不含「已清除 / 已删除」**——实测模型会据此判定「内容没了」，转而重跑命令或把内容转述进推理。
+- **豁免规则**：`read`、`read_tool_result_log`、`isError` 结果、嵌套 `exec.parent` 调用、含非 text block 的结果。
+- 落盘失败时**原样放行**（绝不把一次成功调用变成 `isError`），只写一条 warning 到 `$DSH_HOME/clear-tool-results.log`。
+
+### Verified
+- **确定性集成测试 17/17**：mock `ctx` 直驱 `tools/post-execute`（含「落盘内容与原文逐字节一致」「收据不含『已清除·已删除』」等断言）。
+- **端到端 3 次 headless 沙箱会话**（目标页 `web_fetch` 5,413 字节）：收据化生效；模型写入参 `read <收据里的绝对路径>` 取回全文（0 次重跑命令）；预览够用时**不取回**直接作答。
+- **净收益模型**：平衡取回率 `p* = 75.6%`（1024 阈值 / 300 预览）；`p = 0.5` 时省 1.85 MB，`p = 0.9` 时亏 1.04 MB。对比 4096/300 的 `p* = 87.8%`：覆盖率与净省字节都更高，但脆弱区下移到 1,024–1,500 字节档。**取回率尚未在真实使用中测准，它是本机制唯一的决定性变量。**
+
+### Kept
+- `read_tool_result_log` 工具与旧归档（0.7.0 的 `round-NNNN.json` 仍可按轮读回）；`$DSH_HOME/clear-tool-results.json` 状态文件；`on|off|status` 命令；告警日志（仅异常路径写）。
+
 ## [0.7.0] - 2026-09-14
 
 ### Removed（破坏性）

@@ -2,52 +2,16 @@
 
 # dsh-clear-tool-results
 
-####  维护状态：【弃用/归档】
+DSH 宿主插件：在工具结果**进入上下文之前**做准入过滤。超过阈值的纯文本结果全文落盘到会话目录，模型只收到「收据 + 有界预览 + 绝对路径」；需要原文时用内置 `read`（分页）或 `grep`（检索）取回，也可用插件提供的 `read_tool_result_log` 按轮/步/时间取回。
 
-> **0.7.0 为最后一版，不再做功能维护。** 原因与适用边界见下节：在 DeepSeek-V4.1-Flash 的真实峰价下，本插件的**成本**收益不成立；
+当前版本：**0.8.2**。
 
-DSH 宿主插件：把工具结果**按轮归档**并从对话上下文中清除以减少 Token 消耗；模型可用 `read_tool_result_log` 按轮次或时间自主取回原文。
+## 机制
 
-## 维护状态与适用边界
-
-**已归档，0.7.0 为最后一版。归档原因：成本口径下不成立。**
-
-DeepSeek-V4.1-Flash 官方峰价（[官方价目](https://api-docs.deepseek.com/quick_start/pricing)）：输入命中 **$0.006/M**、输入未命中 **$0.30/M**、输出 **$1.20/M**——命中价只有未命中的 **1/50**（`c = 0.02`）。在这个价目结构下，按 10 轮 × 10 步、每步 1 Think + 1 个 1K 工具结果（`T = 1000`/步、占位符 `p = 35` token）推算：
-
-| 单步 Think | 省（占基线 input 成本） |
-| --- | --- |
-| 0（无思维链） | 47.2% |
-| 300 | 28.0% |
-| 1000 | **5.6%**（$0.0066；占含输出的总账单 2.8%） |
-| ≥ 1,312 | 0（盈亏平衡点） |
-| 2000 | −8.3% |
-
-两个让 5.6% 在真实使用中进一步归零的结构性原因：
-
-- **「不清除」的基线本身命中率已达 98%**（9,702,000 / 9,900,000）：前缀天然稳定，「保住缓存」没有可保的空间，清除只可能引入重算。每轮边界都要把上一轮尾部（`9T + 10p`）按**全价**重算一次，9 次边界即 66,150 token；而重算代价随 `T` 线性增长——带 `tools` 的请求必须回传历史 `reasoning_content` 并拼进上下文（[官方 thinking_mode 文档](https://api-docs.deepseek.com/guides/thinking_mode)），所以每步 Think 都真占 prompt。
-- **一次取回就能吃掉大半收益**：取回一条 5K 结果 ≈ 5K 走全价 + 一个额外助手回合的 Think 输出 ≈ **$0.0027**，相当于 10 轮省额的 41%。
-
-**它仍然成立的地方：**
-
-- **上下文头寸，与价格无关**：同一算例的上下文峰值 **198,000 → 111,150（−44%）**。会话本来会撞上下文上限时，它买的是「跑得完」，不是「省钱」。
-- **短思维链 / 无思维链**：`T = 0` 省 47.2%、`T = 300` 省 28.0% 的 input。
-- **命中价占比更高的模型**：`c = 0.25` 时省基线 input 的 **39.5%**，回到与 token 省额同阶的量级；`c` 越小越不划算，DeepSeek 的 1:50 是最极端的一档。
-
-**下文「缓存命中与成本分析」里的 4.3%~20.3% 是按 `c = 0.25` 假设算的，不是 DeepSeek 真实峰价**；按 `c = 0.02` 重算会显著下调、部分情形转负。该节保留为测量记录——断点位置（上一轮第一个工具结果）、保留率 33%~47%、占位符需字节级固定等约束都是实测结论，仍然有效；原始 token 净省额 4,342,500 与 Think 长度无关，也仍然成立。但它**不再作为价值主张**。
-
-代码仍可安装使用；归档只是不再把它当省钱工具宣传，也不再跟进 DSH 核心变化。
-
-<img alt="image" src="https://github.com/user-attachments/assets/a1247911-e0b6-4ae1-97ba-c99a17c31da0" />
-
-## 兼容性
-
-同一份代码支持三代核心，无需改配置或按环境区分：
-
-| 核心代数 | 差异 | 插件行为 |
-| --- | --- | --- |
-| 老核心 | 事件数组为 `session.events` | `eventsOf()` 回退读 `session.events` |
-| ≥ 0.1.2-rc.1 | 事件数组改为 `session.log` | `eventsOf()` 优先读 `session.log` |
-| ≥ 0.1.5-rc.1 | surface replace 键名改为 `startSeq`/`endSeq` | 按会话头版本选键名，被拒时换另一代重试一次 |
+- **作用点**：`tools/post-execute` waterfall（`{ prepend: true }`），在结果 materialize 之前决定它的形态。
+- **从不改写已发送内容**：被收据化的结果从未进入上下文，因此没有轮边界的缓存前缀重建，也不需要任何核心补丁。
+- **判定用原始内容**：判定与落盘一律读 `result.content`，不受同一条瀑布上其它监听者（如 `spill-policy`）对模型可见内容的改写影响。
+- **失败安全**：落盘失败时原样放行（绝不把一次成功调用变成 `isError`），只写一条 warning。
 
 ## 安装
 
@@ -55,200 +19,145 @@ DeepSeek-V4.1-Flash 官方峰价（[官方价目](https://api-docs.deepseek.com/
 dsh plugin --profile web add dsh-clear-tool-results
 ```
 
-在 `~/.dsh/profiles/web/cordis.patch.yml` 注册：
-
-```yaml
-- insert:
-    - id: clear-tool-results-host
-      name: 'dsh-clear-tool-results'
-```
+包内的 `cordis.patch.yml` 通过 `package.json` 的 `dsh.bundle.patch` 声明，安装时由宿主注入（`id: clear-tool-results-host`），无需手工编辑 profile 的 patch 层。安装或升级后需**重启 dsh GUI**：进程内已 import 的模块不会热替换，不重启则仍在跑旧构建。
 
 ## 使用
 
 | 命令 | 效果 |
 | --- | --- |
-| `/clear-tool-results on` | 启用：工具结果按轮归档，并在下一轮开始前从对话清除 |
-| `/clear-tool-results off` | 停用：保留工具结果、不再归档 |
-| `/clear-tool-results status` | 显示启用状态与插件版本 |
+| `/clear-tool-results on` | 启用：超过阈值的纯文本工具结果落盘，模型侧只留收据与预览 |
+| `/clear-tool-results off` | 停用：工具结果原样进入上下文 |
+| `/clear-tool-results status` | 显示启用状态、准入阈值、豁免工具与插件版本 |
 
-状态存于 `$DSH_HOME/clear-tool-results.json`（`DSH_HOME` 未设置时回退 `~/.dsh`）：`{ "enabled": true }`；旧的 `{ enabled, mode }` 仍可读，`mode` 被忽略。
+- **默认启用**：状态文件不存在时按启用处理。
+- 状态存于 `$DSH_HOME/clear-tool-results.json`（`DSH_HOME` 未设置时回退 `~/.dsh`），内容为 `{ "enabled": true }`；旧状态文件里的 `mode` 字段会被忽略。
+- `read_tool_result_log` **无条件注册**：停用后仍可读取此前落盘的归档，只是不再产生新的落盘。
+- 准入判定走内存缓存的状态，关闭时零 I/O 直接放行。
 
-## 功能
+## 准入规则
 
-0.7.0 保留的能力就是下面这几条：**每轮归档 → 按轮清除（留占位符）→ 模型按需用 `read_tool_result_log` 取回**。
+对每条工具结果依次判断，命中任一条即**原样放行**；全部不命中且是超过 1024 字节的纯文本时才落盘 + 收据：
 
-- **归档**：每轮结束时，从追加式会话日志（而非改写后的 surface）取出该轮原始 `tool/result`，保留轮次/步骤号、工具名与匹配的 `tool/call`，写入 `round-NNNN.json` 并登记 `index.json`；以 index 为准、幂等，可补归档中途启用或重启前的轮次。
-- **清除**：`turn/end` 把该轮 surface 节点替换为占位符，例如 `[第 3 轮工具结果已清除归档：bash → git status（1.2k），可用 read_tool_result_log(turn: 3) 读取]`。
-- **归档上限 49000 字节（UTF-8）**：超限结果**不归档**——harness 的 spill 策略在 50000 字节处把结果换成「首尾预览 + 通知」并从**中间**掐掉，存了也取不回完整原文。占位符写成「已清除（该结果 49.5k 字节，超过 49000 字节上限，未归档）…。未保存原文，如需请重新执行原工具获取」，**不给取回坐标**；同轮若还有可归档结果则保留坐标并追加「本轮另有 N 条超 49000 字节的结果未归档，需要时请重新执行原工具」。规则同时写进工具描述，随工具注入 Agent。
-- **占位符索引**：占位符带紧凑索引——工具名 → 关键参数（命令/路径/模式）+ 规模 + 是否失败，整行压到 60 字以内；同一步的多条合并成一行（最多列 2 条，其余归入「等 N 条」）；PTC（`run_code`）下优先显示里面的子调用（`bash → git status`），而不是 run_code 的代码前缀。让模型先知道「里面有什么」，再决定要不要取回。
-- **取回**：`read_tool_result_log` 注册为模型工具，按 `turn` 或 `time` 读取。返回**紧凑纯文本**（非 JSON）：每条以 `--- turn N step S · 工具名 · 参数摘要 · 第 A-B 行 / 共 T 行 · N 字符 / M 字节 ---` 开头（参数摘要为空时省略；`offset` 越过末尾时行窗口显示为「第 T 行之后无内容（共 T 行）」），后接原文。
-- **输出预算 48000 字节**：按**整份载荷**计（含表头与末尾通知 ⇒ 整份 ≤ 48400 字节，**永不触发 harness 截断**）；正文 ≤47.7k 字节可一次取回；更大的结果需带 `offset`/`limit` 分段，被截断的条目会附「续取：offset=…」坐标；若单条超出预算且未分段，则跳过该条并提示改用 `offset`/`limit`。
-- **依赖**：仅 Node 内置模块；适用于所有会话与 agent preset；与 DSH 内置 compaction 兼容。
+| 条件 | 处理 |
+| --- | --- |
+| 决策不是 `accept`，或带 `value`（结构化输出） | 原样 |
+| 嵌套调用 `exec.parent`（PTC 子调用，不进模型上下文） | 原样 |
+| 工具是 `read`、`read_tool_result_log` | 原样（内容就是下一步的必需输入，或本身就是取回通道） |
+| `result.isError === true` | 原样（报错内容是排障必需） |
+| 结果含任何非 text block | 原样（准入策略只认纯文本） |
+| 纯文本，≤ **1024 字节** | 原样 |
+| 纯文本，> **1024 字节** | **落盘 + 收据** |
 
-> **0.7.0 的功能面 = 每轮归档 + 按轮清除（占位符索引）+ `read_tool_result_log` 取回**，外加 49000 字节归档上限与分页。overclock 模式、配套核心补丁、归因埋点与逐轮追踪日志均已移除。每步清除解决不了「模型把自己的输出当缓存」：实测 ≤49000 字节的已清除结果里，事后只有 **5.5%** 走取回、**52.6%** 靠记忆代偿（41.2% 抄进推理、11.3% 抄进可见正文），而推理会被适配器以 `reasoning_content` 回灌上下文。
+取不到 session 上下文时也原样放行。
 
-## 缓存命中与成本分析
-
-本插件对工具结果的处理是**每轮结束后原地替换为固定占位符**，而非直接删除。但省 Token 的主力是「清除」这件事本身：历史不再携带全部工具结果。占位符的作用是保住 `tool_call`/`result` 配对，并给模型留下取回索引。
-
-### 前缀缓存：断点落在上一轮第一个工具结果处
-
-DeepSeek 的上下文缓存是**块对齐的前缀缓存**（实测会话里 `cacheReadTokens` 全部是 64 的整数倍）：从第 1 个 token 开始连续完全一致的部分才能复用 KV，一旦某个位置不匹配，从该位置往后全部未命中。
-
-清除发生在 `turn/end`：上一轮的工具结果被替换成占位符，而占位符与真实结果字节不同——所以**下一轮首个请求必然在「上一轮第一个工具结果」处断开，与直接删除断在同一个 token 位置**。
-
-Agent 多步调用中，工具结果天然穿插在助手消息之间：
+## 收据（模型看到的内容）
 
 ```
-S  U1  A1  T1  A2  T2  A3  T3
+[bash · npm test · 84,231 字节 / 2,104 行 → 全文已落盘，此处是尾部 30 行]
+路径：/Users/…/sessions/…/tool-result-logs/results/t0001-s0003-01-bash-call_00_ab12.txt
+取全文：read 该路径（可用 offset/limit 分页），或 grep 该路径检索。
 
-S：系统提示 + 工具定义
-U1：用户消息
-A1 A2 A3：助手思考/调用
-T1 T2 T3：工具结果
+……（中间省略 2,074 行，共 2,104 行）
+<尾部 30 行原文>
 ```
 
-下一轮首个请求里，上一轮的 `T` 已经变成占位符 `P`：前缀比对到 `A1` 结束时撞上 `P1 ≠ T1`，于是 `A2 P2 A3 P3 U2 …` 全部按全价重算。
+- 第一行：工具名 · 参数摘要 · 原始字节数 / 总行数 · 预览方向与行数。参数摘要 ≤60 字符，按 `command`/`file_path`/`path`/`pattern`/`query`/`description`/`prompt`/`url` 的顺序取第一个非空字段。
+- 预览 300 字节，按**整行**取（不切坏 UTF-8）：`bash`/`run_code` 取**尾部**（最终状态与错误），其余工具取**开头**（命中列表与正文开头）。取尾部时省略提示在预览之前，取开头时在预览之后。
+- 预览是**硬上限**：若首个候选行本身就超过 300 字节（压缩 JSON、base64、长单行），该行会被**按字节裁切**，收据里写明「该行过长，此处仅显示…」——不再出现「预览等于全文、收据反而比原文长」。
+- 收据**恒短于原文**：落盘前先算收据，收据不比原文短时不落盘、原样放行（只有超长 cwd / `DSH_HOME` 才会触发）。准入过滤永不把上下文变大。
+- **刻意不写「已清除 / 已删除」**：实测这类措辞会被读成「内容没了」，模型转而重跑命令或把内容转述进推理。收据的语义是「全文在盘上，路径在此」。
+- 落盘文件是纯文本，可直接 `read`（分页）或 `grep`（检索），不需要学新工具。
+- 注意收据那句「或 grep 该路径检索」：`grep` **不在豁免名单**，其结果超过阈值时同样会被收据化。当前真正稳定的取回通道是 `read`（豁免）。
 
-实测（`~/.dsh/sessions` 中清除真正生效的会话；命中 = `cacheReadTokens`，保留率 = 命中 / 上一轮末 prompt）：
+## 落盘与索引
 
-| 会话 | 上一轮步数 | 上一轮末 prompt | 下轮首请求 prompt | 命中 | 保留率 |
-|---|---|---|---|---|---|
-| session-2b193d28 | 10 步 | 38437 | 28081 | 12672 | 33.0% |
-| session-ce28482c | 13 步 | 34399 | 27539 | 11392 | 33.1% |
-| session-3e1783ea | 2 步 | 32345 | 17849 | 15232 | 47.1% |
-| session-d19ab3bd | 15 步 | 36768 | 28696 | 14464 | 39.3% |
+```
+<session>/tool-result-logs/
+  index.json                              # schemaVersion 3
+  results/t0001-s0003-01-bash-call_00_ab12.txt
+```
 
-判定式：命中 ≈ `上一轮首请求 prompt + 上一轮首条助手消息`（9 个边界误差 <1.5%）——命中的最后一个 token 恰好是上一轮首条助手消息的末尾，紧接着就撞上被替换掉的工具结果。
+- 文件名：`t<turn 4位>-s<step 4位>-<同轮同步序号 2位>-<工具名≤16>-<callId≤12>.txt`。turn/step 取自 `session/event` 维护的每会话游标，取不到时为 `0000`。
+- `index.json`：`{ schemaVersion: 3, sessionId, workspace, updatedAt, results[] }`；每条为 `{ turn, step, callId, tool, hint, file, relFile, bytes, lines, time }`，其中 `file` 是**绝对路径**。
+- **幂等**：同一 `callId` 只落一份，重放或重试不会重复归档。但 `callId` 缺失（非字符串）时该机制失效——索引里存 `null`、查找用 `undefined` 永不匹配，于是每次调用都会新落一份，且文件名里 callId 段为空（`…-bash-.txt`，因为 `safeSegment` 用 `?? ''`）。
+- 同一会话的索引写入串行化，避免 `index.json` 读写竞争。
+- 会话目录优先由 `sessionPersistence.locate()` 解析；不可用时回退默认布局 `$DSH_HOME/sessions/<projectKey>/<encoded-session-id>/tool-result-logs`，编码规则与 `dsh-session-persistence-jsonl` 一致。
 
-- **「每轮请求命中上一轮结束时的完整序列、只需计算新增的 `U_n A_n T0`」不成立**：上一轮尾部（该轮全部工具结果 + 其后的助手消息）每一轮都要按全价重算一次。多步轮（10~13 步）保留率只有 33%~47%，上一轮步数越多越低；上一轮只有 1 步时工具结果就在末尾，保留率才接近 100%。
-- 保留率接近 100% 的会话是**清除没有生效**（旧版本语义，结果仍留在 prompt 里：下轮首 prompt / 上轮末 prompt ≈ 1.03）。那是「不清除」的性质，不是占位符带来的。
+## `read_tool_result_log` 工具
 
-**关键前提**：占位符必须字节级固定，不能包含时间戳、随机数或变化的摘要——占位符本身内容一旦变化，前缀同样会断。本插件生成的占位符格式固定（轮次号 + 工具名 + 参数摘要 + 字节数），符合这一要求。
-
-### 省在哪里：长期体积，而不是前缀稳定性
-
-省在 prompt 的长期体积上：不清除时每个历史工具结果会被后续每一步按命中价反复读；清除后 durable history 只剩助手消息 + 占位符。用同一批实测 token 数重建「不清除」对照（每步 prompt 都带上全部历史结果、命中上一请求的前缀）：
-
-| 会话 | 轮 / 步 | c | 实测成本 | 对照（不清除） | 省 |
-|---|---|---|---|---|---|
-| session-2b193d28 | 4 / 31 | 0.25 | 452484 | 564057 | 19.8% |
-| session-3e1783ea | 3 / 6 | 0.25 | 81375 | 102087 | 20.3% |
-| session-ce28482c | 3 / 16 | 0.25 | 126634 | 132346 | 4.3% |
-| session-e0725c8c | 3 / 8 | 0.25 | 91250 | 101768 | 10.3% |
-
-`c = 0.1` 时省 2.7%~16.0%。三点提醒：
-
-- 第 1 轮没有历史可清，两种做法完全相同；从第 2 轮起才有净收益，轮数越多被清掉的历史越久，省得越多。
-- 省的比例取决于**每轮步数**（每轮边界要全价重算上一轮尾部，步数越多这笔越贵）与命中价 `c`；上表是 3~4 轮短会话，只说明方向与量级。
-- 「压缩成本恒为不压缩的 30%」那类换算属于**理想化模型**（假设除新增助手消息外全部命中），与实测结构不符，别当结论用。
-
-### 为什么用固定占位符而不是直接删除
-
-- **配对约束**：助手消息里的 `tool_call` 必须有配对的 `tool_result`，直接删结果就得连助手消息一起改写——断点前移、推理文本丢失（结构推演：成本比占位符高 52%~65%）。占位符保住了配对结构。
-- **可见索引**：占位符是模型判断「要不要取回」的唯一线索——工具名 → 关键参数 + 规模 + 是否失败，外加 `read_tool_result_log(turn: N)` 坐标。
-- **字节级固定**：占位符写入后不再变化（不含时间戳、随机数或变化的摘要），从下一轮起长期可命中；若占位符内容每轮都变，前缀同样会断。
-
-## read_tool_result_log 工具
+收据里已直接给出单条路径，多数情况直接 `read` 即可；这个工具用于按轮/步/时间取回。
 
 | 参数 | 说明 |
 | --- | --- |
-| `turn` | 轮次编号（1 起），如 `read_tool_result_log({ turn: 3 })` 读取第 3 轮 |
-| `time` | ISO 8601 时间或毫秒时间戳，读取该时刻所在轮次 |
-| `offset` / `limit` | 可选：只取原文的第 `offset` 行起、最多 `limit` 行。大结果用它分段取 |
-| 都不传 | 已归档轮次列表 |
+| `turn` | 轮次编号（1 起），读取该轮全部归档 |
+| `step` | 可选，配合 `turn` 精确到某一步 |
+| `time` | ISO 8601 时间或毫秒时间戳，取该时刻（±30 分钟）所在的轮 |
+| `offset` / `limit` | 可选，按行窗口取回；对**每条**结果各自生效 |
+| 都不传 | 归档清单：按轮汇总 + 最近 40 条的坐标与路径，不返回正文 |
 
-- `turn` 接受数字或纯数字字符串（schema 为 `integer`/`string`）。
-- `step` 参数自 0.7.0 起移除；仍传 `step` 会返回明确提示，请改用 `turn` 取回整轮。
-- **返回体是紧凑纯文本，不是 JSON**：每条为「表头 + 原文」，约 1.0×。旧版输出整条归档条目（`JSON.stringify`），同一份原文出现两次、体积 3–5 倍，会被 harness 从**中间**切开并落盘成 spill。
-- **归档上限 49000 字节**：超限结果不保存，占位符写明尺寸（**按字节**）并要求重新执行原工具，**不给取回坐标**；同轮若还有可归档结果则保留坐标并追加「本轮另有 N 条超 49000 字节的结果未归档，需要时请重新执行原工具」。
+- 纯数字字符串会被归一化成数字（`turn: "3"` 等价 `turn: 3`）。
+- 返回体是紧凑纯文本，每条是一段以 `---` 开头、以 `---` 收尾的区块：
+
+  ```
+  --- turn 3 step 5 · bash · npm test · 第 1-2104 行 / 共 2104 行 · 84231 字节
+      路径：/Users/…/tool-result-logs/results/t0003-s0005-01-bash-call_00_ab12.txt ---
+  <正文>
+  ```
+
+  整份载荷受 **48000 字节**预算约束，超预算的条目会被跳过并提示缩小 `turn+step` 范围或直接 `read` 路径。
+- `turn` 不是正整数时报错「轮次编号必须为正整数」；该轮无归档时报错并列出已归档轮次；`time` 无法解析时报错。
+- **旧归档可读**：0.7.0 写的 `round-NNNN.json` 仍可按轮取回（正文从旧事件的 `tool-result` block 中提取）；旧版 `index.json`（只有 `rounds`、没有 `results`）按空结果集处理，由旧文件兜底。
+
+## 设计取值
+
+| 常量 | 值 | 作用 |
+| --- | --- | --- |
+| `INLINE_MAX_BYTES` | 1024 | 准入阈值（UTF-8 字节） |
+| `PREVIEW_BYTES` | 300 | 收据预览预算（字节） |
+| `RENDER_BUDGET_BYTES` | 48000 | 取回渲染总预算，留在 harness 的 50000 字节截断线以内 |
+
+- 预览**必须显著小于**阈值：收据固定开销约 426 字节（头行 131 + 路径行 203 + 指引行 88 + 换行），阈值 1024 配预览 300 时 `R̄ = 705 B`、上限 827 B。若预览保持 1200，1,024–1,500 字节档里约 22.9% 的收据会比原文更长（降到 300 后为 0）。
+- 阈值 1024 相对 4096 是拿取回率换覆盖率：更多调用被收据化、字节覆盖更高，但平衡取回率 `p*` 从约 87.9% 降到约 **75.5%**（本机 80 会话 / 1,238 条触发，用真 `receiptText` 离线复算）。也就是说：**真实取回率低于 75.5% 时净赚，高于它则净亏**。
+- 阈值扫描（预览 300）：`p*` = 75.5 / 79.2 / 82.0 / 85.7 / 87.9%（阈值 1024 / 1536 / 2048 / 3072 / 4096），字节覆盖 93.1% → 68.8%。净省在 `p ≤ 0.2` 时 1024 最优、`p = 0.3` 时各档几乎相同、`p ≥ 0.5` 时 2048 领先约 8%。**取回率未测准之前维持 1024。**
+- 单条口径：原文 `S`、收据 `R`、取回时多一轮开销 `C`——不取回省 `S−R`，取回则付出 `R+C`。取回率是唯一的决定性变量，尚未在真实使用中测准。
+- **边界**：本机制只覆盖工具结果。豁免工具（如 `read`）、reasoning、assistant 输出与系统提示都不受它影响。
 
 ## 工作原理
 
-1. 监听 `session/event` 的 `turn/end` 与 `turn/start`；另监听 `tool/ptc-dispatch`，只为占位符索引登记 `run_code` 内部真正干活的子调用。
-2. `turn/end`：从追加式日志收集该轮原始 `tool/result`，按 `callId` 解析工具名，写 `round-NNNN.json` 与 `index.json`；再把该轮 surface 节点替换为占位符（保持 tool-result 包装结构）。
-3. `turn/start`：只补归档中途启用或重启前未归档的轮次，不在此清除；清除统一在上一轮的 `turn/end` 执行，因此下一轮 prompt 组装时该轮结果已不可见。
-4. `read_tool_result_log` 从调用方会话目录读取归档并返回原文。
-5. 归档与清除失败只写 warning 到 `$DSH_HOME/clear-tool-results.log`（**只有异常路径才写**，正常路径零 I/O；0.7.0 起不再有 per-turn/per-step 追踪行），不牵连彼此的流程。
+1. `apply()` 注册四件事：`/clear-tool-results` 命令、`session/event` 监听、`tools/post-execute` 监听（`prepend: true`）、`read_tool_result_log` 工具。
+2. `session/event` 中凡带数字 `turn`/`step` 的事件都更新该会话的游标，供落盘时标注坐标。
+3. `tools/post-execute` 里先 `await next()`，再按准入规则判断；命中落盘条件时用 `result.content` 写文件并登记 `index.json`，返回 `{ kind: 'accept', content: [收据] }`（保留上游的 `additionalContexts`）。
+4. 落盘失败或任何异常：`warn()` 后原样返回上游决策，绝不把成功调用变成错误。warning 同时交给 `ctx.logger` 并追加到 `$DSH_HOME/clear-tool-results.log`——只有异常路径写，正常路径零 I/O。
+5. `read_tool_result_log` 从调用方会话目录读 `index.json` 与落盘文件，返回原文。
 
-## Demo：验证 `read_tool_result_log` 跨轮取回
+## 兼容性
 
-**目的**：证明工具结果被清除后，模型能在**后续轮次**用 `read_tool_result_log` 取回原文，而不是靠上一轮的记忆复述。
-
-**关键设计——随机 token**：固定串（如 `TOPSECRET-12345`）模型在生成它的那一轮见过，可能靠记忆答对；随机串无法预知，只有真正取回才能答对。
-
-**前置**：`/clear-tool-results on`（`/clear-tool-results status` 应显示 enabled）。
-
-### 第 1 轮：生成随机 token，要求不复述
-
-发送：
-
-> 执行 `python3 -c "import secrets; print('DSH-DEMO-' + secrets.token_hex(8))"`。
-> 只回复「完成」，不要复述命令输出，也不要在思考或正文里出现任何 token。
-
-工具结果先显示完整值，随后被替换为占位符：
-
-```
-[第 1 轮工具结果已清除归档：bash → python3 -c "..."（26），可用 read_tool_result_log(turn: 1) 读取]
-```
-
-> ✅ 检查点 1：第 1 轮回复里**不得**出现 `DSH-DEMO-`。一旦出现，说明 token 已写进对话，之后可能靠记忆而非取回答对。
-
-### 第 2 轮：显式跨轮取回
-
-发送：
-
-> 调用 `read_tool_result_log({ turn: 1 })` 取回第 1 轮那条命令的原始输出，把完整 token 原样发我；不要用 bash/read 翻文件。
-
-预期发起的工具调用与返回（工具名/行数/字节数随调用方式与输出浮动；直接调用 `bash` 时表头显示 `bash`，PTC/`run_code` 下显示 `run_code`）：
-
-```
-查询：第 1 轮
-
---- turn 1 step 1 · bash · {"command":"python3 -c \"...\""} · 第 1-N 行 / 共 N 行 · … 字符 / … 字节 ---
-DSH-DEMO-xxxxxxxxxxxxxxxx
-
-取回提示：归档在每轮结束时写入，之后随时可读；如需引用多轮原文，可在总结前逐轮取回。
-```
-
-### 通过标准
-
-1. 第 2 轮**确实调用** `read_tool_result_log({ turn: 1 })`，而不是用 bash/read 绕过。
-2. 返回体以 `查询：第 1 轮` 开头，`--- turn 1 step 1 · … ---` 表头之后是原文。
-3. 模型回答的 token 与第 1 轮归档里的 token **逐字相同**——随机值意味着不可能是背出来的。
-
-### 可选扩展
-
-- 空参数 `read_tool_result_log({})` → `已归档轮次：turn 1（…步，…条）`，确认归档已登记。
-- 中间多聊几轮后再问同一问题 → 仍取回同一 token，证明取回与轮次间隔无关。
-- 用 `time` 参数（取 `index.json` 中该轮的 `timeFrom` 毫秒值）→ 命中同一轮。
-
-### 一键核对
-
-```sh
-grep -o 'DSH-DEMO-[0-9a-f]*' ~/.dsh/sessions/*/*/tool-result-logs/round-0001.json
-```
-
-输出应与第 2 轮回答中的 token 一致。
+- 依赖 `tools/post-execute` waterfall（本机 `0.1.5-rc.1` 核心验证通过）。不使用 surface 改写，因此不需要按核心代数切换 op 键名，也不需要任何核心补丁。
+- 只用 Node 内置模块；适用于所有会话与 agent preset；可与内置 `compaction`、`spill-policy` 共存。
+- **与内置监听者的顺序**（读宿主源码定论）：cordis 的 waterfall 按监听器**注册数组顺序**执行，**数组头 = 最外层**，`register()` 用 `prepend ? 'unshift' : 'push'`；`dsh-tools` 的 `postExecute` 把**同一个 `result` 对象**交给每个监听者，只用最外层活下来的 `decision.content` 覆盖结果。本插件用 `{prepend:true}` ⇒ **最外层**；`spill-policy` / `dsh-tool-fs-search` / `dsh-repeat-tool-reminder` 都不带选项 ⇒ 内层。两个后果：①本插件读到的是**原始** `result.content`，与顺序无关；②模型看到的是**本插件收据**（指向会话目录里持久的全文），spill 的预览被覆盖——代价是 >50000 字节的结果会被 spill 重复落一份（已知冗余，未处理）。
+- `inject: ['commands', 'tools', 'sessionPersistence']`。
 
 ## 验证
 
-**跨轮取回**：见上一节 Demo（随机 token + 通过标准）。
-
-**超限回归**：跑一条 >49000 字节的输出（如 `python3 -c "print('中'*16600)"`）→ 占位符应写明「该结果 49.8k 字节，超过 49000 字节上限，未归档」，且 `tool-result-logs/` 下**不得**出现该条目的归档记录。
-
-文件检查：
+- **确定性测试（L1，已入库）**：`npm test`（`node --test "test/*.test.mjs"`）跑 **85** 个用例，mock `ctx` 直驱 `tools/post-execute` 与取回工具。覆盖：**准入判定** 15（阈值边界、按字节不按字符、多 text block 无分隔符拼接、豁免与 `isError`/嵌套/非纯文本/`value` 原样）、**收据与预览** 12（头行格式、取端规则、300 字节硬上限、单行裁切不切坏码点、收据恒短于原文、无「已清除/已删除」）、**落盘与索引** 17（文件名与截断、幂等、ordinal、并发、索引损坏重建、路径编码、`locate` 与回退、无收益时不落盘）、**取回** 13（清单 / turn / step / time、逐条 offset·limit、48000 预算跳过、报错分支、旧 `round-NNNN.json` 回读）、**旧数据回读** 4、**状态与命令** 6、**宿主共存** 8（waterfall 顺序、内层改写被丢弃、反序时收据被覆盖但全文已落盘、`read` 双豁免、`additionalContexts` 透传）、**失败路径** 10（不可写、日志不可写、`DSH_HOME` 不存在、非 ASCII cwd）。用例走隔离的临时 `DSH_HOME`，每条一份全新模块实例（`DSH_HOME` 与 `stateCache` 都在 import 时定型）。
+- **端到端**：用 `web_fetch` 这类**结果大小不可预处理**的工具（`bash` 不行——模型会主动把大输出重定向掉）。用隔离的 `DSH_HOME` 起 headless 会话，抓一个超过 1024 字节的页面：
 
 ```sh
-ls ~/.dsh/sessions/*/*/tool-result-logs/
-cat ~/.dsh/sessions/*/*/tool-result-logs/round-0001.json
+DSH_HOME=<隔离的 DSH_HOME> dsh --profile headless \
+  --patch <path>/plugin-patch.yml "抓取 <url>，告诉我 <需要看正文细节的问题>"
+```
+
+预期：工具结果被换成收据；模型用 `read <收据里的绝对路径>` 取回全文；落盘文件出现在 `<session>/tool-result-logs/results/`。
+
+```sh
+ls "$DSH_HOME"/sessions/*/*/tool-result-logs/results/
+cat "$DSH_HOME"/sessions/*/*/tool-result-logs/index.json
 ```
 
 ## 卸载
 
-1. 删除 `cordis.patch.yml` 中的注册行；
-2. `dsh plugin --profile web remove dsh-clear-tool-results`；
-3. 可选：删除 `$DSH_HOME/clear-tool-results.json`、`$DSH_HOME/clear-tool-results.log` 与各 `tool-result-logs/` 目录。
+1. `dsh plugin --profile web remove dsh-clear-tool-results`；
+2. 可选清理：`$DSH_HOME/clear-tool-results.json`、`$DSH_HOME/clear-tool-results.log` 与各会话的 `tool-result-logs/` 目录。
 
 ## 链接
 

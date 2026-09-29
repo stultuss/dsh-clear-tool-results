@@ -1,0 +1,425 @@
+# 0.8.0 测试方案（准入过滤机制）
+
+本方案只定义**怎么测**，不实现测试代码、不改 `index.mjs`。测试对象是 0.8.0 的「产出时准入过滤」机制。
+
+## 0. 一句话
+
+用六层测试（L1 确定性 → L6 失败路径）覆盖三个命题：**机制是否正确**、**是否无回归**、**净收益是否成立**；其中唯一尚未测准的决定性变量是**取回率 p̂**，只能由 L2 沙箱端到端产生，判定线是 `p* = 75.6%`。
+
+## 1. 被测对象与身份固化
+
+### 1.1 封版信息（本次实测）
+
+| 项 | 值 | 来源 |
+|---|---|---|
+| 版本 | `0.8.0`（`package.json`） | 实测 |
+| 被测文件哈希 | `index.mjs` md5 **`995b13089c8febde9b47f7bb3aa74544`** | `md5 -q` |
+| 三处副本一致性 | 仓库 / `~/.dsh/profiles/web/node_modules/dsh-clear-tool-results/` / `.sandbox/plugin/` **同哈希** | 实测 |
+| Git 状态 | **未提交**：`M .gitignore/CHANGELOG.md/README.md/index.mjs/package.json`、`?? docs/`；HEAD = `65c2fee`（0.7.0 归档提交） | `git status` |
+| 准入阈值 | `INLINE_MAX_BYTES = **1024**`（2026-09-28 由 4096 改） | 代码 |
+| 预览预算 | `PREVIEW_BYTES = **300**`；`bash`/`run_code` 取尾部，其余取开头（`PREVIEW_BYTES` / `TAIL_PREVIEW_TOOLS` / `takeLines` / `receiptText`） | 代码 |
+| 取回渲染预算 | `RENDER_BUDGET_BYTES = 48000` | 代码 |
+| 豁免 | `read`、`read_tool_result_log`、`isError`、`exec.parent` 嵌套、非纯文本（`EXEMPT_TOOLS` / `onPostExecute`） | 代码 |
+| 落盘产物 | `tool-result-logs/results/t<TTTT>-s<SSSS>-<NN>-<tool>-<callId>.txt` + `index.json`（schemaVersion 3） | 代码 |
+| 状态文件 | `$DSH_HOME/clear-tool-results.json` | 代码 |
+| 已装形态 | bundle 层（`dsh.profile.bundles` + `file:` tgz 依赖），profile patch = `[]` | 实测 |
+| 真实状态 | `{"enabled": true}` ⇒ **0.8.0 此刻正在本 GUI 进程里运行且已启用** | 实测 |
+
+**身份固化的前置动作**：测试开跑前先记录上表哈希（并把 0.8.0 提交，或至少打 tag / 存 tgz 哈希），否则「测的是哪一份 0.8.0」会随工作区漂移。已装副本不随仓库自动同步，每次改代码后必须 `npm pack` → `dsh plugin add` 重装（见 L4.6）。
+
+### 1.2 三个命题
+
+| 命题 | 内容 | 决定层 |
+|---|---|---|
+| **P1 机制正确** | 超阈值纯文本被收据化、原文完整落盘可取回、豁免项不误伤 | L1、L2 |
+| **P2 无回归** | 0.7.0 遗留归档仍可读、安装/开关面不变、与宿主内置机制不冲突 | L3、L4、L5 |
+| **P3 净收益** | 真实取回率 `p̂` 与判定线 `p* = 75.6%` 的关系，以及收据开销 `R`、多出一轮的代价 `C` | L2 |
+
+### 1.3 已知基线（本方案不重测，直接引用）
+
+- 阈值 1024 / 预览 300 的依据：本机 2,781 条可过滤原始结果复算 ⇒ 触发 43.9% 的调用、覆盖 93.6% 的字节、`p* = 75.6%`（脚本 `.sandbox/evidence/2026-09-28/l3/threshold_sim.mjs`）。4096/1200 时代的 16.1% / 59.4% / `p* = 81.1%` 已作废，仅在 `prefilter-plan.md §6.6` 作为历史测量保留。
+- 平衡取回率 `p* = 75.6%`（1024/300；`CHANGELOG.md` 0.8.0 Verified，各阈值对照见 `README.md §评估`）。
+- 0.7.0 的成本结论（1/50 缓存价差、字节口径成立但钱上价值有限）：**结论不变，本方案只测字节口径与取回率，不重算钱**（除 L2.4 实测 `R`、`C` 两点）。
+- 历史教训（必须沿用，否则结论作废）：
+  1. **幸存者偏差**：不得用「归档目录存在」这类与结果相关的条件筛样本（`project_history.md:145`）；
+  2. **取回率不可用单次会话外推**（历史 1/2 命中，`prefilter-plan.md §6.5.4`）；
+  3. `bash` 不适用端到端触发（模型会自己重定向掉输出，`§6.5.5`）。
+
+## 2. 分层与门槛总览
+
+| 层 | 目的 | 环境 | 样本 | 证据 |
+|---|---|---|---|---|
+| **L1** 确定性 | P1 全量边界与分支 | 纯 Node + mock ctx，`DSH_HOME` 指向临时目录 | ~50 条断言 | 断言输出（TAP/文本） |
+| **L2** 沙箱端到端 | P1 + **P3 取回率** | `.sandbox/` 独立 `DSH_HOME` | ≥30 个收据化事件 | 每会话一行 CSV |
+| **L3** 真实会话复盘 | P2 + 阈值统计复核 | 真实 `~/.dsh/sessions`，**只读** | 50 会话 / 213 个 legacy 归档 | 统计脚本输出 |
+| **L4** 安装与开关面 | P2 | 真实 profile（写操作，见 §10） | 三态 + 重装 + 卸载 | `dump-config` diff、状态文件 |
+| **L5** 宿主机制共存 | P1 加强 + 消除历史遗留未知 | 沙箱为主（5.1/5.2/5.3/5.4/5.6/5.7 已由 L1 覆盖） | 5 个构造场景 | 落盘文件对比、监听顺序结论（**已定论**） |
+| **L6** 失败路径与并发 | 健壮性 | 沙箱 | 10 个场景 | warning 日志（定向读）+ 断言 |
+
+**执行顺序有依赖**：L1 全绿 → 才做 L2；L4/L5/L6 可与 L2 并行（不同环境）。
+
+## 3. L1 确定性测试（mock ctx 直驱 `tools/post-execute`）
+
+### 3.1 环境与断言方式
+
+- 直接 `import` 具名导出：`flattenPlainText` / `takeLines` / `receiptText` / `INLINE_MAX_BYTES` / `EXEMPT_TOOLS`（模块底部具名导出，纯函数用例零 mock）；`apply(ctx)` 用 mock ctx 驱动准入路径。
+- **两条 import 时求值的陷阱**（否则测试假绿）：
+  1. `DSH_HOME` 是模块顶层常量 ⇒ 必须在 `import` **之前**设 `process.env.DSH_HOME`，不能测试中途改；
+  2. `stateCache` 也在 import 时读盘 ⇒ 测「禁用态」要先写好状态文件再 import（或经命令 handler 调 `writeState`）。
+- mock ctx 需提供：`commands.register`、`on`（捕获 `session/event`、`tools/post-execute` 回调）、`tools.register`、`get('sessionPersistence')`（返回带 `locate()` 的假对象，或故意抛错走回退）、`logger.warn`。
+- 运行形式：`npm test`（= `node --test "test/*.test.mjs"`，用显式 glob 以免把 `test/harness.mjs` 当成测试文件）。**已入库（2026-09-29），85 个用例全绿**；脚手架在 `test/harness.mjs`，按文件分组：`a-admission`(15) / `b-receipt`(12) / `c-storage`(17) / `d-retrieval`(13) / `e-legacy`(4) / `f-state`(6) / `l5-coexistence`(8) / `l6-failures`(10)。每条用例用带 `?v=N` 查询串的 `import()` 拿**全新模块实例**，并配一个隔离的临时 `DSH_HOME`——这正是上面两条 import 陷阱的对策。
+
+### 3.2 A 准入判定（`onPostExecute`）
+
+| # | 输入 | 期望 |
+|---|---|---|
+| A1 | 纯文本 ASCII，恰好 **1024** 字节 | 原样放行（`<=` 边界） |
+| A2 | 同上 **1025** 字节 | 收据化 |
+| A3 | CJK 多字节：341 个汉字（1023 B）原样；342 个（1026 B）收据化 | 判定按**字节**不是字符 |
+| A4 | 两个 text block（如 `"a"` + `"b"`）总字节超阈值 | 拼接为 `"ab"`（**无分隔符**，`flattenPlainText`）——断言该行为并记录，不判对错 |
+| A5 | 含非 text block（如 image） | 原样，且**不落盘** |
+| A6 | `exec.name === 'read'`，20 万字节 | 原样 |
+| A7 | `exec.name === 'read_tool_result_log'` | 原样 |
+| A8 | `result.isError === true` 且超阈值 | 原样（报错内容不裁剪） |
+| A9 | `exec.parent !== undefined`（PTC 内层） | 原样、不落盘 |
+| A10 | `next()` 返回 `{kind:'error'}` 等非 accept | 原样透传 |
+| A11 | `next()` 返回含 `value` 键的 accept | 原样（`Object.hasOwn(decision, 'value')` 不变式） |
+| A12 | `next()` 返回带 `additionalContexts` 的 accept | 收据化后**仍带** `additionalContexts`（原样保留该字段） |
+| A13 | `stateCache.enabled === false` | 原样，且**零磁盘 I/O**（用只读目录/监视写调用验证） |
+| A14 | 落盘失败（results 目录 chmod 500） | 原样放行；不得把成功调用变成错误；warning 落到 `$DSH_HOME/clear-tool-results.log`（L6.1 复核） |
+| A15 | `exec.agent?.session` 缺失 | 原样 |
+
+### 3.3 B 收据与预览（`receiptText` / `takeLines`）
+
+| # | 检查点 | 期望 |
+|---|---|---|
+| B1 | 头行格式 | `[<tool> · <hint> · N,NNN 字节 / M 行 → 全文已落盘，此处是尾部/开头 K 行]`，字节数带千分位（`toLocaleString('en-US')`） |
+| B2 | 第二行 | `路径：<绝对路径>`，且该路径 `read` 得到逐字节相同的原文 |
+| B3 | 全文 | **不含**「已清除」「已删除」（`receiptText` 的刻意设计） |
+| B4 | 预览体积 | ≤300 字节（常规多行输入） |
+| B5 | **单行 > 300 字节** | **已修（0.8.2）**：首行超预算时按码点裁到 300 字节，`cut.clipped = true`，收据写「该行过长，此处仅显示…」——预览是硬上限 |
+| B5b | 单行取尾 / CJK | 取尾时保留最后 300 字节；CJK 每字 3 字节 → 裁到 300 字节即 100 字，不切出半个码点 |
+| B5c | 多行输入 | `clipped = false`（整行裁剪路径不受影响） |
+| B6 | 取端 | `bash`/`run_code` → 尾部（末行在场）；`web_fetch`/`grep`/其它 → 开头（首行在场） |
+| B7 | 截断提示 | `……（中间省略 X 行，共 Y 行）`，`X = total - lines` |
+| B8 | 行数一致性 | 收据里的「共 Y 行」= `text.split('\n').length` = `index.results[].lines` |
+| B9 | 无 hint 的调用 | 头行不出现多余 ` · `（`entry.hint` 为空串时省略） |
+
+### 3.4 C 落盘与索引（`saveResult` / `readIndex`）
+
+| # | 检查点 | 期望 |
+|---|---|---|
+| C1 | 文件名形态 | `results/t0001-s0002-01-web_fetch-<callId 前 12>.txt` |
+| C2 | `safeSegment` | 非法字符 → `_`；工具名截断 16、callId 截断 12 |
+| C3 | 游标缺失（`session/event` 未建立 turn/step） | 写入 `t0000-s0000-…`，不抛错（`saveResult` 的游标缺省分支）——记为已知行为 |
+| C4 | 字节一致 | 落盘文件与原始 `result.content` 拼接文本 `Buffer.compare === 0` |
+| C5 | `index.json` | `schemaVersion: 3`；`results[]` 含 turn/step/callId/tool/hint/file/relFile/bytes/lines/time；按 turn→step→time 排序 |
+| C6a | 幂等（同 `callId` 二次调用） | 1 个文件、1 条索引，两次返回同一 entry（`saveResult` 的 `callId` 幂等查找） |
+| C6b | **`callId` 缺失（undefined）** | `entry.callId = null` ⇒ `find(item => item.callId === undefined)` 不匹配 ⇒ **每次调用都会新落一份**。断言并记为已知缺陷 |
+| C7 | 同 turn/step 第二条 | ordinal `01`/`02`，且并发下不重号（`enqueue` 内计算） |
+| C8 | 同会话并发 5 条超阈值 | 5 文件、5 条目、ordinal 连续、`index.json` 始终是合法 JSON |
+| C9 | `index.json` 损坏（非法 JSON） | `readIndex` 返回 null ⇒ **以空索引重建**：旧条目从索引消失，但 `.txt` 文件仍在——记数据风险，见 §13 |
+| C10 | `encodeSegment` | `'~'`/`'.'`→`~002E`/`'..'`→`~002E~002E`/空串抛错/non-ASCII 转 `~XXXX` |
+| C11 | `projectKey` | 多分隔符折叠为单个 `-`；>251 截断；`--` 包裹 |
+| C12 | `logsDirOf` | `persistence.locate()` 可用 ⇒ 用其 path 的父目录；`get` 抛错或缺失 ⇒ 回退 `$DSH_HOME/sessions/<projectKey>/<encodeSegment(id)>/tool-result-logs` |
+| C13 | **无收益护栏（0.8.2 新增）** | 收据（含绝对路径）不短于原文时**不落盘、不写索引、原样透传 `next()` 的 decision**，且不产生 warning（是主动放弃，不是失败）。构造：超长 `DSH_HOME` + 超长 cwd 使路径 ≳630 B，原文 1,025 B |
+| C13b | 同一环境下原文更长（4,000 B） | 仍正常收据化 ⇒ 证明护栏只挡「收据更长」，不是环境写不了 |
+
+### 3.5 D `read_tool_result_log`
+
+| # | 调用 | 期望 |
+|---|---|---|
+| D1 | 无参 | 清单模式：`rounds` 汇总 + 最近 40 条坐标/路径，正文为「（清单模式不返回正文）N 字节 / M 行」 |
+| D2 | `{turn: 1}` | 该轮全部条目原文 + 每条 `路径：` |
+| D3 | `{turn: 2, step: 3}` | 仅该步条目 |
+| D4 | `{turn: 1, offset: 5, limit: 3}`，两条长度不同的结果 | offset/limit **对每条各自生效**（`renderRetrieval` 的窗口计算），不是全局行游标 |
+| D5 | `limit` 越界 | 显示 `…（本结果还有 X 行未显示；续取：offset=…, limit=…）` |
+| D6 | 多条合计 > 48000 字节 | 跳过若干条 + `⚠️ 还有 N 条未显示…` + 「已显示 M 条」（`renderRetrieval` 的预算跳过分支） |
+| D7 | `{turn: 0}` / `{turn: -1}` / `{turn: 1.5}` | `错误：轮次编号必须为正整数` |
+| D8 | 不存在的 turn/step | 报错并列出已归档轮次（`readByTurn` 的报错分支） |
+| D9 | `{time: '1759…'}` 毫秒串 / ISO 8601 / 不可解析串 | 分别命中 / 命中 / `无法解析时间`；窗口是 ±30 分钟；窗口内有两条时取排序后第一条（`.find`，见 `readByTime`）——断言当前语义 |
+| D10 | 归档 `.txt` 被删除 | 跳过该条、不谎报可读（`collectTurnData` 的读文件 try/catch） |
+| D11 | `{turn: "3"}`（字符串） | `normalizeReadArgs` 转数字后命中 |
+| D12 | 无 session | `{error: '无可用会话上下文'}`，渲染为 `错误：…` |
+
+### 3.6 E 旧数据回读（`readIndex` / `readLegacyTurn` / `legacyRoundTurns`）
+
+| # | 场景 | 期望 |
+|---|---|---|
+| E1 | `index.json` 只有 `rounds`（0.7.0 的 v2） | `readIndex` 返回 `results: []`，不抛错 |
+| E2 | 存在 `round-NNNN.json` | `readLegacyTurn` 从 `tool-result` 块的 text 片段拼出正文；`step` 过滤生效 |
+| E3 | legacy 条目 | `file: null` ⇒ 渲染不出现「路径：」行 |
+| E4 | `roundSummaries` | legacy 轮次以 `count: 0`、`stepCount: 0` 出现，不与 v3 轮次重号。**注意**：函数内部给 legacy 记录设过 `legacy: true`，但结尾的 `.map()` 没有输出该字段 ⇒ 渲染与返回体里**永远看不到** `legacy`（代码侧死字段，记为观测项） |
+
+### 3.7 F 状态与命令面（`apply` / `defaultState` / `normalizeState` / `readState` / `writeState`）
+
+| # | 检查点 | 期望 |
+|---|---|---|
+| F1 | `on` / `off` / `status` | 文案正确；状态文件被写入 `{enabled: <bool>}` |
+| F2 | `status` 的版本号 | 来自**同目录** `package.json`（`PLUGIN_VERSION`）⇒ 沙箱副本必须同步 `package.json`（现在还是 0.7.0，见 L2.1） |
+| F3 | 状态文件缺失/损坏/无 `enabled` | `normalizeState` 默认 **`enabled: true`**（默认值来自 `defaultState()`）——默认值是开，断言并记录 |
+| F4 | 旧状态含 `mode` 字段 | 原样保留但不再使用 |
+| F5 | 禁用态 | `read_tool_result_log` **仍被注册**（`apply()` 里的 `ctx.tools.register`，无条件）——观测项，见 §13 |
+| F6 | 外部直接改状态文件 | **不立即生效**：`stateCache` 只在命令路径刷新（`readState` / `stateCache`）；断言并要求重启或走命令 |
+
+### 3.8 允许失败项（记为已知行为，不阻塞 L1 判定）
+
+B5 已修（0.8.2，见 §3.3）；C3（游标缺失写 t0000-s0000）、C6b（callId 缺失不幂等）、C9（索引损坏丢条目）、F3（默认开）、F5/F6 仍按「记行为、不判对错」断言。
+
+## 4. L2 沙箱端到端（唯一能测取回率的层）
+
+### 4.1 环境与前置
+
+- 布局：`.sandbox/{.dsh,plugin,workspace}`（已在 `.gitignore`）。
+- **必须先修的两处环境缺陷**（属测试环境，不是被测代码）：
+  1. `.sandbox/plugin/package.json` 仍是 `0.7.0` ⇒ 沙箱里 `status` 会报错版本（F2）；同步 `index.mjs`/`package.json`/`cordis.patch.yml`。
+  2. `.sandbox/.dsh/profiles/web/node_modules` 是**指向真实 `~/.dsh/profiles/web/node_modules` 的 symlink**（0.7.0 时代的耦合方式）；当前插件只 import `node:fs/promises`、`node:fs`、`node:os`、`node:path`，故暂不致命，但会与真实环境共享模块解析 ⇒ 建议改为复制，或明确记录「本层隔离只覆盖 `DSH_HOME`」。
+- 隔离实质 = **独立 `DSH_HOME`**，与目录位置无关（`project_history.md:162`）。
+- 独立 `DSH_HOME` 无凭据 ⇒ `.credentials.yaml` 软链真实文件（`§6.5.5` 踩坑）。
+
+### 4.2 启动与触发工具
+
+```sh
+DSH_HOME=<repo>/.sandbox/.dsh \
+DSH_PERMISSION_MODE=danger-full-access \
+dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "<固定 prompt>"
+```
+
+- `DSH_PERMISSION_MODE` 必需：headless 默认 `workspace-write` + `ask`，无人应答则 bash 被拒（`§6.5.5`）。
+- **触发工具必须是结果大小不可预处理的**：用 `web_fetch` 抓一个固定 URL；`bash` 会被模型自己改写成重定向（`§6.5.5`）。
+- 每个场景固定「URL + 问题」，保证可重复；每次用**新会话**（避免历史上下文影响）。
+
+### 4.3 场景矩阵
+
+| 场景 | 构造 | 预期 | 测什么 |
+|---|---|---|---|
+| **A 细节问** | `web_fetch` 一个 >1024 B 的固定页 + 只靠正文才能答的问题 | 收据化 + 模型 `read <收据路径>` 取回 | 取回率分子、`R`、`C`、轮次 +1 |
+| **B 基线 OFF** | 同 A 的问题，`/clear-tool-results off`（或未装） | 结果原样 5–20 KB | 对照字节与 prompt 峰值 |
+| **C 预览可答** | 同 URL + 预览第一行就能答的问题 | 收据化、**不取回** | 预览命中率 |
+| **D 超大结果** | 抓 >50000 B 的页面（触发宿主 spill 与准入过滤同时作用） | 模型看到**本插件收据**，路径指向**全文**而非 spill 预览 | L5.2 的能力提升点 |
+| **E 失败结果** | 调用必然失败且报错体 >1024 B 的工具 | 原样（A8） | isError 豁免在真实链路成立 |
+| **F 阈值附近** | 4,096–6,000 B 档页面（历史脆弱区，`p*` 仅 56.7%） | 记录是否取回 | 脆弱区专项 |
+
+### 4.4 取回率口径与样本量（决定性）
+
+- 口径：`p̂ = 取回事件数 / 收据化事件数`。
+  - 收据化事件：会话日志中带本插件收据文本（`全文已落盘`）的 `tool/result`，或 `results/` 下新增文件数；
+  - 取回事件：`read` 的 `file_path` 命中 `tool-result-logs/results/`，或 `read_tool_result_log` 调用。
+    - 注：命中 `tool-result-logs/index.json` **不算**取回，口径限定在 `results/` 子路径。
+    - **口径盲区（2026-09-28 发现，实测确认）**：上面只数「读归档路径」，但模型可以换个工具拿回同一份信息（实测：`bash head -60 CHANGELOG.md` 被收据化后，模型直接 `read CHANGELOG.md` 把内容取回上下文），A1/A2 都看不见 ⇒ **系统性低估 `p`**。补第三信号 **A3 绕道重获**：收据所属调用的参数里出现过的路径，在其后被 `read`/`grep`/`bash` 再次访问。已实现为只读脚本 `.sandbox/evidence/2026-09-28/p-scan/p_scan.mjs`（同时把**开发会话**与**真实使用会话**分列，避免把"被要求测试取回"算作真实意愿）。
+- **样本量**：历史 1/2 命中不可外推 ⇒ 每场景 ≥10 次独立会话，**合计 ≥30 个收据化事件**，再算 `p̂` 与 Wilson 95% 区间。
+- **判定**：区间**上界 < 75.6%** ⇒ 机制在字节口径上成立；否则判「未证成立」，回到阈值/预览质量决策（§13）。
+- 同批实测 `R`（收据字节，现约 1,712）与 `C`（多出一轮的代价，现约 803）替换 `prefilter-plan.md §6.6` 里来自单次会话的值；并记录 `R/S` 比值（历史 1,712/5,413 = 31.6% 是净亏来源）。
+- 禁止：用 `bash` 造大结果；把「开发者被要求测试取回」的会话算作真实取回意愿（`project_history.md:144`）。
+
+### 4.5 证据文件
+
+每会话一行 CSV，列：`sessionId, 场景, 收据化条数, 取回条数, ΣS(原文字节), ΣR(收据字节), prompt 峰值, 轮次, 备注`。落在 `.sandbox/evidence/<日期>/l2/`。
+
+## 5. L3 真实会话只读复盘
+
+**当前基线（2026-09-28 快照；已被下方 2026-09-29 更新取代）**：67 个会话日志 / 6,399 个 `tool/result` 事件（原始 3,251、0.7.0 占位符 3,125、spill 预览 24、**0.8.0 收据 0**）；50 个 `tool-result-logs` 目录，`index.json` **全部 `schemaVersion: 2`**，**0 个 `results/` 目录**，213 个 `round-*.json`。⇒ 0.8.0 在真实环境里**至今零触发、零样本**。
+
+| # | 检查项 | 方法 | 判定 |
+|---|---|---|---|
+| 3.1 | 0.8.0 产物边界 | 记录 `results/` 目录出现的时间点与会话 | 插件已 ON（`enabled: true`）⇒ 新会话出现 `results/` 是**预期**；0.7.0 历史会话出现才是异常 |
+| 3.2 | **legacy 回读真实性**（E 层唯一真数据） | 挑 3–5 个 `round-*.json`，用 `read_tool_result_log(turn: N)` 回读，与文件内 text 块逐字节比对 | 100% 一致 |
+| 3.3 | 索引 ↔ 文件一致性 | 逐目录断言 index 每条 `file` 存在、`bytes` == 实际 size、无孤儿 `.txt` | 100% |
+| 3.4 | 阈值统计复核 | 用 `threshold_sim.mjs` 重跑拐点与 `p*`（现口径 67 会话 / 2,781 条可过滤结果；历史为 78 会话） | 与 README §评估 的 **43.9% / 93.6% / `p* = 75.6%`** 一致（漂移 >3pp 记入 §13） |
+| 3.5 | 噪音审计 | `$DSH_HOME/clear-tool-results.log` 是否有新增 warning（定向 `tail`/`rg`，遵守 `.log` 纪律） | 无新增异常 |
+| 3.6 | 识别口径校准 | 用附录 C 的**行首锚定**判据重算收据数与 `results/` 目录数 | 两者一致；子串/行内判据一律不用 |
+
+**已跑一次（2026-09-28，只读，样本 67 会话 / 6,399 个 `tool/result` 事件）**：原始结果 3,285 条、0.7.0 占位符 3,125 条、spill 预览 24 条、**0.8.0 真收据 0 条**；`results/` 目录 0 个。⇒ 准入过滤在真实环境**至今零触发**（脚本与输出：`.sandbox/evidence/2026-09-28/l3/`）。同批复算发现「>4096 字节覆盖 70.0%」与设计记录的 59.4% 相差 10.6pp，是本次把阈值改到 1024 的动机之一；改后各档数据见 README §评估。
+
+**2026-09-29 更新（第二次只读复盘，79 会话 / 6,583 条 `tool/result`）**：收据 **11 条，全部落在本项目开发会话**（`session-d19ab3bd` 7 条 + 本次会话 4 条），**真实使用 0 条**；其中 `read` 收据 **0 条**（`read` 豁免，从未落盘）。A1 取回事件 78（开发 77 / 真实 1）、A3 绕道重获 7、A2 同参重跑 0。⇒ 上面的「零触发」已被打破，但**真实样本仍为 0**，G2 继续无法判定。工具与输出：`.sandbox/evidence/2026-09-28/p-scan/`。
+
+**2026-09-29 更新（第三次只读复盘：3.1 / 3.2 / 3.3 / 3.5 逐项跑完，脚本 `.sandbox/evidence/2026-09-29/l3/`）**：
+
+| # | 结果 |
+|---|---|
+| 3.1 产物边界 | ✅ `schemaVersion: 3` 只出现在 **2 个会话**，且都属于本项目（`session-522450ea` 7 条、`session-9cbc4b1f` 13 条）；其余 50 个全是 0.7.0 的 v2 |
+| 3.2 legacy 回读 | ✅ **逐字节一致**：6 个会话 / 12 轮 / **75 条**，0 处不一致、0 个空轮。做法不依赖 live GUI——`apply(mock ctx)` 后直接调**真的** `read_tool_result_log.execute({turn})`，用 `persistence.locate` 把目录指向真实会话目录（真实目录零写入） |
+| 3.3 索引 ↔ 文件 | ✅ **100%**：52 个目录 / 20 条 v3 条目，`file` 缺失 **0** · `bytes` 不符 **0** · `lines` 不符 **0** · 孤儿 `.txt` **0**；213 个 `round-*.json` |
+| 3.5 噪音审计 | ✅ `$DSH_HOME/clear-tool-results.log` 共 **8 行**、最后写入 **2026-09-14**（0.7.0 trace 时代），**2026-09-28 起 0 行** ⇒ 0.8.x 正常路径零 warn I/O |
+| 3.4 阈值复核 | ✅ 见 §13.13（`.sandbox/evidence/2026-09-29/r-measure/`）：`R̄ = 705 B`、`p* = 75.5%`，与设计记录一致 |
+| 3.6 识别口径校准 | ✅ 行首锚定判据同时用于 `r-measure` 与 `l3`；收据与 `results/` 目录数自洽 |
+
+⇒ **G3 通过**。**环境事实（会静默出错，务必记住）**：本机**没有 `rg`**（`command -v rg` 为空）⇒ `rg … | head` 返回空串、会被误读成「0 条」。文档命令已改用 `grep`，测量脚本改用 `tail -n` + `wc -l`。
+
+纪律：全部**只读**；会话日志用 `zstd -dc`（多帧）解压后落 `.sandbox/` 或 `/tmp`，**不入库**；含他项目源码/密钥的样本不外传、用完删。
+
+## 6. L4 安装与开关面
+
+| # | 检查项 | 命令/方法 | 期望 |
+|---|---|---|---|
+| 4.1 | 幂等重装 | `npm pack` → `dsh plugin --profile web add <tgz>` | 成功，无 `duplicate loader entry id` |
+| 4.2 | 单条目 | `dsh --profile web --dump-config \| grep -n -B2 -A2 'clear-tool-results'` | **恰好一条** entry，来自 bundle 层 |
+| 4.3 | 残留文件审计 | profile 下 `cordis.patch.yml.bak-20260928-134448`、`cordis.patch.yml.dup-135322` | 文件名不匹配加载名 ⇒ 断言**未被加载**；是否清理见 §13 |
+| 4.4 | 三态实测 | 真实 GUI 里 `on`/`off`/`status`；OFF 时用 >1024 B 的 `web_fetch` 验证原样，ON 时验证收据化 | 行为与文案一致 |
+| 4.5 | 禁用态工具注册 | OFF 时观察 `read_tool_result_log` 是否仍在工具列表 | 按代码**仍在**（`apply()` 里的 `ctx.tools.register`）——观测项 |
+| 4.6 | 副本一致性 | `md5 -q` 比对仓库 / 已装副本 | 相同；改代码后必须重装，否则「测 A 跑 B」 |
+| 4.7 | 卸载 | README §卸载 三步 | dump-config 无条目、工具消失、状态文件保留但无效 |
+
+**事故回归（必须覆盖）**：`duplicate loader entry id "clear-tool-results-host"` 的根因是**两处 insert**——profile 手工 insert + bundle 自带 `cordis.patch.yml`（已装副本里确实带着 `- insert: [clear-tool-results-host]`）。4.1/4.2 就是这条的回归测试；操作纪律：**「加进 bundles」与「移除手工 insert」必须拆成两条独立指令**。
+
+## 7. L5 与宿主内置机制共存
+
+| # | 检查项 | 方法 | 判定 |
+|---|---|---|---|
+| 5.1 | **监听顺序** | ~~沙箱探针~~ **已定论（2026-09-29，读宿主源码 + 8 条回归断言）** | ✅ 见下 |
+| 5.2 | **双落盘** | 构造 >50,000 B 的纯文本结果 | ✅ 确定性：内层 spill 的预览被本插件收据覆盖；本插件 `results/*.txt` == **原始全文**。**观测项**：spill 仍会内层重复落一份（冗余，未处理） |
+| 5.3 | 顺序相反时的防御 | 若 spill 在外层 | ✅ 防御成立且**与顺序无关**：`postExecute` 把同一个 `result` 交给每个监听者，本插件读 `result.content` ⇒ 永远拿到原文。反序只会让**收据**被外层覆盖（用例 5.3 记录该行为） |
+| 5.4 | `read` 双豁免 | 大文件 `read`（>50 KiB） | ✅ 确定性：不落盘、不加 `content`（宿主 spill 也显式跳过 `exec.name === 'read'`） |
+| 5.5 | compaction pruner | 统计 compaction 时刻 surface 上 >8192 码点的结果数 | ⏳ 需真实/沙箱 compaction 触发（阈值 800k token，本机够不到） |
+| 5.6 | PTC 子调用 | `run_code` 内外层各造一条大结果 | ✅ 内层不落盘、外层落盘。**观测项不变**：`recordPtcDispatch` 写的账本无人读取（`ptcItems` 仅导出），`run_code` 收据 hint 只来自参数 |
+| 5.7 | 与其它 post-execute 监听者 | `dsh-repeat-tool-reminder`（阈值 3/5/8）等 | ✅ 确定性：内层把 `additionalContexts` 合并进 downstream 后，本插件收据化仍原样保留该字段 |
+
+**5.1 结论（定论，证据链）**：cordis `EventsService.waterfall` 按监听器**注册数组顺序**执行，**数组头 = 最外层**；`register()` 用 `prepend ? 'unshift' : 'push'`（`cordis/src/events.ts`：`waterfall` 的 `cbs.shift()` 与 `register` 的 `method`）。`dsh-tools` 的 `postExecute` 调 `ctx.waterfall(scopeTarget(this, exec.agent), "tools/post-execute", exec, result, …)`，且**把同一个 `result` 对象传下去**，最终只用返回值里的 `decision.content` 覆盖结果（`dsh-tools/lib/index.js:3377-3405`）。本插件注册时带 `{prepend:true}` ⇒ 位于数组头 ⇒ **最外层**；宿主内置监听者 `dsh-spill-policy`(:155)、`dsh-tool-fs-search`(:848 / :1159)、`dsh-repeat-tool-reminder`(:1495) 都**不带选项** ⇒ 追加 ⇒ **内层**。
+
+两个后果：①**读原文与顺序无关**（每个监听者拿到的 `result` 都是原始对象，本插件不看内层的 `decision.content`）；②**收据是最外层写入**，覆盖掉内层 spill 的预览 —— 模型看到的是本插件收据 + 会话目录里的持久全文路径，比 spill 的进程私有 `$TMPDIR` 路径更可靠。**唯一代价**：>50000 字节结果会被 spill 内层重复落一份（内层先执行完才轮到本插件改写）。
+
+**身份校验（补自查缺口）**：上面读的 `dsh-tools/lib/index.js` 与**活体加载的是同一份**——`dsh` 的 bin shim 指向 store `global/v11/499c6f07…`（不是最初以为的 `9b6b-18d4…`），两个 store 里该文件的 md5 都是 `d5ffbc07399ccfedd4217141606702de` 且 `[ A -ef B ]` 为真；顺序语义也在**编译产物 `lib/index.js`** 里核对过（不只看 `src/events.ts`）。证据：`.sandbox/evidence/2026-09-29/l5/`。
+
+以上全部固化为 `test/l5-coexistence.test.mjs` 的 8 条断言（含测试脚手架对 cordis 顺序语义的复刻：`harness.mjs` 的 `ctx.on` 现在认 `{prepend}` 并 `unshift`）。
+
+## 8. L6 失败路径与并发
+
+| # | 场景 | 期望 |
+|---|---|---|
+| 6.1 | `results/` chmod 500（不可写） | 原样放行、调用结果**不是** isError、warning 写入 `$DSH_HOME/clear-tool-results.log` |
+| 6.2 | `index.json` 写入非法 JSON 后再次触发 | 空索引重建、无异常；`*.txt` 仍在（数据风险，见 §13） |
+| 6.3 | `index.json` 只读 | 落盘失败 → 原样 + warning |
+| 6.4 | 同会话并行 5 条超阈值 | 5 文件 + 5 条目、ordinal 连续、JSON 合法（`enqueue` 串行化） |
+| 6.5 | 同 `callId` 并发重复 | 幂等：1 文件 1 条目（`callId` 存在时） |
+| 6.6 | 超长工具名/callId（各 200 字符） | 截断到 16/12；单段文件名不超文件系统上限 |
+| 6.7 | **游标时序** | ✅ **真实环境已测（2026-09-29）**：2 个 v3 会话 / 22 条，索引坐标 = 结果事件自带坐标 = `cursorBefore`，**错位 0**；`cursorBefore` 的来源事件全是 `tool/call`（DSH 在工具体执行**前**就发出带正确 turn/step 的事件 ⇒ 无滞后）。证据 `.sandbox/evidence/2026-09-29/l6/` |
+| 6.8 | `warn()` 自身失败 | `ctx.logger` 抛错 + 日志文件不可写 ⇒ 不得抛出（`warn`） |
+| 6.9 | `DSH_HOME` 不存在 | 状态默认 on；落盘时 `mkdir -p` 自建 |
+| 6.10 | 非 ASCII cwd（中文目录） | `projectKey` 编码与 `persistence.locate` 路径一致（真实环境挑一个中文路径项目冒烟） |
+
+## 9. 判定门与成功标准
+
+| 门 | 条件 | 不通过时 |
+|---|---|---|
+| **G1** | L1 除 §3.8 已知项外全绿 | 修代码（超出本方案范围）后再进 L2 |
+| **G2** | L2：`p̂` Wilson 上界 < 75.6%，且 `R/S ≤ 20%`（20% 为建议值，历史实测 31.6% 是净亏来源） | 判「未证成立」，回到阈值/预览/收据长度决策 |
+| **G3** | L3：一致性 100%、legacy 回读逐字节一致 | 视为回归，阻塞 |
+| **G4** | L4：dump-config 单条目、三态可用、重装无重复 id | 阻塞发布 |
+| **G5** | L5：5.1/5.2 有**确定结论**（哪种顺序都算过），5.4/5.6/5.7 有观测记录 | 5.1 未定论则阻塞（缓存语义依赖它） |
+| **G6** | L6：所有失败路径均「原样放行」、无数据丢失（C9/6.2 可记为 accepted） | 数据丢失项阻塞 |
+
+## 10. 真实环境执行纪律（用户已授权在真实 `~/.dsh` 验证）
+
+**写操作清单（改动前备份）**
+
+- `~/.dsh/profiles/web/package.json`、`pnpm-lock.yaml`、`cordis.patch.yml`、`cordis.yml`
+- `~/.dsh/profiles/web/node_modules/dsh-clear-tool-results/`
+- `~/.dsh/clear-tool-results.json`（**当前 `{"enabled": true}`，先记录原值**）
+- 新增产物：各会话 `tool-result-logs/results/`、`~/.dsh/clear-tool-results.log`
+
+**回滚**：改动前 `cp -a ~/.dsh/profiles/web ~/.dsh/profiles/web.bak-<ts>`；沿用既有 `cordis.patch.yml.bak-*` 习惯；状态文件按记录值还原。
+
+**禁止**：删改真实会话 `*.jsonl`；把含他项目源码的样本写入仓库；在真实环境做超阈值压力测试（只在 `.sandbox` 做）；未备份就改 profile。
+
+**只读纪律**：所有 `.log` 只用 `tail -n` / `rg` / `sed -n`（项目规则 §6），不整读；会话日志 `zstd -dc` 解压后落到临时区，任务结束清理。
+
+## 11. 执行顺序与工作量
+
+| 步 | 动作 | 验证点 | 估时 |
+|---|---|---|---|
+| 1 | 固化身份（哈希 + 提交/打 tag）、同步沙箱（`package.json` 0.7.0→0.8.0） | 三份哈希一致，沙箱 `status` 报 0.8.0 | 0.5h |
+| 2 | L1 用例实现（§3.2–3.7）并跑通 | 除 §3.8 外全绿 | 4h |
+| 3 | L4 安装开关面（§6） | dump-config 单条目、三态正常 | 1.5h |
+| 4 | L6 失败与并发（§8） | 失败路径全部原样放行 | 2h |
+| 5 | L5 共存（§7），先做 5.1 顺序测定 | 确定监听顺序 + 双落盘结论 | 2.5h |
+| 6 | L2 端到端 ×（场景 A–F，≥30 个收据化事件） | `p̂` 与区间、`R`、`C` | 4h + 模型调用时间 |
+| 7 | L3 只读复盘（§5） | 一致性 100%、legacy 回读一致 | 1.5h |
+| 8 | 汇总 `docs/test-report-0.8.0.md` | 六门结论 + 偏差清单 | 1h |
+
+## 12. 不覆盖范围与盲区
+
+- **准确性（解出率）**：无对照实验预算，不做因果声明。
+- **成本/缓存**：不重算钱；只实测 `R`、`C` 两个点。
+- **reasoning/thinking、assistant 输出、系统提示**：不在范围内（`index.mjs` 只碰 `tool/result`）。
+- **阈值本身是否最优**：1024/300 已由 2026-09-28 复算选定，本方案只验证该配置，不重开参数搜索。
+- **统计外推**：30 个收据化事件只能给宽区间，不能外推到其他仓库/工具分布。
+- **`bash` 类结果的端到端**：受模型自适应规避影响，无法在此层稳定造样本。
+
+## 13. 待决策点
+
+1. **【已完成·2026-09-29】L1 脚本已入库**：`test/` + `npm test`（`node --test "test/*.test.mjs"`），**85 个用例全绿**（A 15 / B 12 / C 17 / D 13 / E 4 / F 6 / L5 8 / L6 10）。脚手架 `test/harness.mjs` 每个用例一份全新模块实例 + 隔离临时 `DSH_HOME`（对应 §3.1 的两条 import 陷阱）。**其余已知偏差按"记行为、不判对错"落地**：C3 `t0000`、C6b `callId` 缺失不幂等、C9 索引损坏丢条目、F3 默认开、F5/F6（B5 已在 0.8.2 修掉）。**新增发现**：`callId` 缺失时文件名该段是**空**（`…-bash-.txt`），不是 `undefined`——`safeSegment` 用的是 `?? ''`。
+2. 沙箱 `node_modules` symlink 是否改为复制（真隔离）。
+3. `.sandbox/plugin/package.json` 版本号 0.7.0 是否同步修正。
+4. profile 里 `.bak` / `.dup` 残件是否清理。
+5. L2 样本量（每场景 ≥10 次）与模型调用成本是否接受。
+6. 真实环境是否允许临时 `off` → `on`（会改变当前 ON 状态），以及是否允许用真实 GUI 会话自然产样。
+7. **【已决策·2026-09-29】C9/6.2（索引损坏丢条目）不修**：加「从 `results/*.txt` 重建索引」属于为不可能发生的场景写错误处理（索引只由本插件串行写、有 `enqueue` 序列化）；改为把风险写明——`.txt` 才是真相源，索引丢了文件还在。出现真实损坏再定。
+8. **C6b（`callId` 缺失不幂等）**与 **F5（禁用态仍注册工具）**是否修。
+9. **【已决策·2026-09-28】阈值与预览改为 1024 / 300**（原 4096 / 1200）。依据：本机 2,781 条可过滤结果复算 ⇒ 触发 43.9% 调用、覆盖 93.6% 字节、`p* = 75.6%`、收据比原文更长的仅 3 条（0.2%）；同时发现「>4096 字节覆盖 70.0%」与设计记录 59.4% 差 10.6pp、`p99 码点` 29,264 vs 记录 36,026（疑语料缩水 67 vs 77–78 会话 + 提取口径不同）。**遗留**：①是否把口径差异追溯清楚（需重解压历史会话，不改代码）；②1024 的脆弱区（1,024–1,500 B）若在 L2 实测中 `p̂` 偏高，是否需要回到 2048 或继续压预览。
+10. **【已解除·2026-09-29】活体已重启**：活体确认 1024/300——2,120 B 的 `bash` 被收据化（旧构建 4096 会放行）、收据预览 6 行 ≈266 B（旧构建 1200 约 22 行）；仓库 = 已装副本 md5 `69e19b05…`。⇒ 与 1024/300 相关的 L2/L3 结论现在可采。**L4 4.6（副本一致性）通过；4.1（幂等重装）与 4.4（三态实测）当时仍未跑**（后续：2026-09-29 重装 0.8.2 并重启，4.1/4.2/4.3/4.6 通过、活体 md5 更新为 `71582992…`，详见 §14 G4）。
+11. **测量脚本是否入库**：`p_scan.mjs`（取回率只读测量，含 A3「绕道重获」）目前只在 `.sandbox/evidence/2026-09-28/p-scan/`（gitignored）。是与 §13.1 的 L1 脚本一起纳入 `test/` + `npm test`，还是维持"证据脚本不入库"。
+12. **A3 是否进正式口径**：把「绕道重获」写进 §4.4 的判定口径，还是只作为补丁信号保留在测量脚本里。
+13. **【已评估·2026-09-29】阈值维持 1024**（数据在 `.sandbox/evidence/2026-09-29/r-measure/`）：用**真** `receiptText` 重算本机 80 会话 / 1,238 条触发：`R̄ = 705 B`、`R` 上限 827 B、`p* = 75.5%`（与记录 75.6% 一致）。阈值扫描 `p*` = 75.5 / 79.2 / 82.0 / 85.7 / 87.9%（1024 / 1536 / 2048 / 3072 / 4096）；净省在 `p ≤ 0.2` 时 1024 最优、`p = 0.3` 时三档几乎相同（3,395 / 3,411 / 3,356 KB）、`p ≥ 0.5` 时 2048 领先约 8%。**结论：取回率测准之前不动 1024**；若 L2 测出 `p̂ > 0.4`，首选动作是把阈值提到 1536–2048（不是压预览——删掉整条指引行只值 +1.5pp `p*`）。
+14. **【已修·2026-09-29】B5 单行超预算预览 → 预览硬上限**（0.8.2）：`takeLines` 首行超预算时改按码点裁切（`clipLine`），并新增 `saveResult` 护栏「收据不比原文短就不落盘」。实测影响 10/1,238 条（0.8%），修复前这 10 条全部产出「收据 ≥ 原文」（合计多 +4.1 KB，单条最多 +437 B），修复后 `R ≥ S` 为 0。
+15. **【新增·2026-09-29】**spill 内层重复落盘（>50000 B 结果被 `dsh-spill-policy` 与本插件各存一份）。已知冗余，未处理；要不要在收据里额外给出 spill 路径或干脆接受，待定。
+
+## 14. 执行状态回填（截至 2026-09-29）
+
+| 门 | 状态 |
+|---|---|
+| G1 L1 | **通过（2026-09-29）**——`test/` 已入库，`npm test` **85/85** 全绿（B5 已在 0.8.2 修掉，其余 §3.8 已知项按"记行为"处理） |
+| G2 L2 取回率 | **未判定**——真实收据 0 条；口径已补 A3 盲区（§4.4） |
+| G3 L3 | **通过（2026-09-29）**——3.1/3.2/3.3/3.4/3.5/3.6 全部跑完：索引↔文件一致性 100%（0 缺失 / 0 bytes 不符 / 0 lines 不符 / 0 孤儿）、legacy 回读逐字节一致（75 条 0 处）、0.8.x 告警日志零新增（§5 第三行表） |
+| G4 L4 | **部分（2026-09-29 重装 0.8.2 并重启后）**——4.1 幂等重装 ✅、4.2 单条目 ✅（dump-config 548 行 / `clear-tool-results-host` 恰好 1 次，来自 bundle 层）、4.3 残留审计 ✅（`cordis.patch.yml` = `[]`）、4.6 副本一致性 ✅（仓库 = 已装副本 = `71582992…`）；**4.4 三态实测与 4.5 禁用态仍需真实 GUI 斜杠命令**。活体判据：单行 1,600 B 结果被裁到 300 B 且收据写「该行过长」（0.8.1 会整行返回），落盘文件 1,600 B 保真。证据 `.sandbox/evidence/2026-09-29/l4/` |
+| G5 L5 | **通过（2026-09-29）**——5.1/5.2/5.3/5.4/5.6/5.7 均有确定结论并已固化为 8 条断言；仅 5.5（compaction pruner）因本机够不到 800k 阈值而未观测 |
+| G6 L6 | **部分**——10 个失败/并发场景已由 L1 覆盖（`l6-failures`）；真实环境：warning 日志审计**已做**（§5 三次复盘的 3.5：0.8.x 起 0 行）、**6.7 游标时序已测（错位 0/22）**；仍欠真实环境下的**失败注入**（需 headless 沙箱） |
+
+**可用的只读证据**：`.sandbox/evidence/2026-09-28/p-scan/`（取回率与 `read` 反事实）、`.sandbox/evidence/2026-09-28/l3/`（首次 0.8.0 触发复盘）、`.sandbox/evidence/2026-09-29/r-measure/`（`R` 实测 + `p*` + 阈值扫描 + 修复前影响）、`.sandbox/evidence/2026-09-29/l3/`（索引一致性 + legacy 回读 + 噪音审计）、`.sandbox/evidence/2026-09-29/l4/`（安装面与活体判据）、`.sandbox/evidence/2026-09-29/l5/`（宿主依赖身份校验）、`.sandbox/evidence/2026-09-29/l6/`（游标时序）。
+
+## 附录 A 命令速查
+
+```sh
+# L1
+npm test                     # = node --test "test/*.test.mjs"
+
+# L2 沙箱
+DSH_HOME=<repo>/.sandbox/.dsh DSH_PERMISSION_MODE=danger-full-access \
+  dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "抓取 <url>，回答 <问题>"
+
+# L3 会话日志（多帧 zstd，必须 -dc）
+zstd -dc <session>/session.v3.jsonl.zstd > /tmp/s.jsonl && grep -n '全文已落盘' /tmp/s.jsonl | head
+
+# L4
+dsh --profile web --dump-config | grep -n -B2 -A2 'clear-tool-results'
+
+# R 与 p*（只读，真 receiptText）
+node .sandbox/evidence/2026-09-29/r-measure/measure.mjs
+
+# 日志纪律（禁止整读 .log）
+tail -n 50 ~/.dsh/clear-tool-results.log
+```
+
+## 附录 B 证据目录
+
+`.sandbox/evidence/<YYYY-MM-DD>/{l1,l2,l3,l4,l5,l6}/`，每层一个 `README` 写明：命令、样本数、原始输出路径、结论一行。`.sandbox/` 已在 `.gitignore`，证据不入库。
+
+**跨层工具**：`.sandbox/evidence/2026-09-28/p-scan/`（`p_scan.mjs` + `README.md` + `report.txt/json`）——取回率只读测量，同时服务 L2（真实 `p`）与 L3（收据/取回统计），含 A3「绕道重获」信号；`.sandbox/evidence/2026-09-29/r-measure/`（`measure.mjs` + `report.txt`）——用真 `receiptText` 量 `R`/`p*`、按档与按阈值扫描、修复前影响复算。
+
+## 附录 C 会话日志口径
+
+- `~/.dsh/sessions/<projectKey>/<sessionId>/session.v3.jsonl.zstd` 是**多帧** zstd：Node `zstdDecompressSync` 只解第一帧，必须 `zstd -dc`。
+- 收据化识别（**必须行首锚定**）：结果文本**以收据头行开头**才算触发，即 `/^\[[^\]\n]*→ 全文已落盘，此处是(尾部|开头) \d+ 行\]$/` 命中文本第 1 行；或直接数 `results/` 下文件。
+  - 两次假阳性（2026-09-28 实跑，务必沿用结论）：①按子串 `全文已落盘` 匹配，会把「读了含该字符串的源码/文档（`index.mjs`、本方案）」的 `read` 结果误判为收据；②按行内正则（非行首）匹配，会把「bash 输出里打印的收据样例」误判。两种误判分别多算 4 条与 1 条。
+- 取回识别：`read` 入参 `file_path` 命中 `tool-result-logs/results/`，或存在 `read_tool_result_log` 调用。
+- 用量口径（若需 prompt 峰值）：`assistant/message` 的 `data.usage.inputTokens`（未命中）+ `data.usage.cacheReadTokens`（命中）。
+
+## 附录 D 与既有文档的对应
+
+| 本文 | 既有出处 |
+|---|---|
+| §1.3 阈值依据、`p*` | `docs/prefilter-plan.md §6.6`、`CHANGELOG.md` 0.8.0 Verified |
+| §3.1 17 项参考实现 | `README.md §验证`、`prefilter-plan.md §6.5.2` |
+| §4.2 沙箱踩坑 | `prefilter-plan.md §6.5.5` |
+| §4.3 A/B/C 场景 | `prefilter-plan.md §6.5.3` |
+| §6 安装形态与重复 id 事故 | `project_history.md:191-210` |
+| §1.3 三条历史教训 | `project_history.md:144-147` |
