@@ -19,6 +19,33 @@ test('D1 无参：清单模式，不返回正文', async (t) => {
   assert.match(renderRetrieve(env, {}, value), /已归档：turn 1/)
 })
 
+test('D1b 清单模式头行报**真实**尺寸，不再冒充占位串尺寸', async (t) => {
+  const env = await boot(t)
+  const s = session()
+  const text = LP(80) // 80 行，远大于 1024 字节
+  await archive(env, s, text, { turn: 1, step: 1, callId: 'd1b-a' })
+  const value = await callRetrieve(env, {}, s)
+  const idx = await readFirstIndex(env.home)
+  const entry = value.toolResults[0]
+  assert.equal(entry.bytes, idx.results[0].bytes)
+  assert.equal(entry.lines, idx.results[0].lines)
+  const out = renderRetrieve(env, {}, value)
+  const head = out.split('\n').find((line) => line.startsWith('--- turn 1 step 1'))
+  assert.match(head, new RegExp(`${idx.results[0].lines.toLocaleString('en-US')} 行`))
+  assert.match(head, new RegExp(`${idx.results[0].bytes.toLocaleString('en-US')} 字节`))
+  assert.ok(!head.includes('第 1-1 行'), `清单模式不该声明行窗：${head}`)
+})
+
+test('D1c 轮次模式头行格式不变（行窗仍在）', async (t) => {
+  const env = await boot(t)
+  const s = session()
+  const text = LP(80)
+  await archive(env, s, text, { turn: 1, step: 1, callId: 'd1c-a' })
+  const value = await callRetrieve(env, { turn: 1 }, s)
+  const out = renderRetrieve(env, { turn: 1 }, value)
+  assert.match(out, /第 1-80 行 \/ 共 80 行 · \d+ 字节/)
+})
+
 test('D2 {turn:1}：取回该轮正文与路径', async (t) => {
   const env = await boot(t)
   const s = session()

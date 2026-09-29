@@ -435,9 +435,15 @@ function renderRetrieval(args, value) {
     const lines = text.split('\n')
     const from = Math.min(offset, lines.length)
     const to = limit > 0 ? Math.min(from + limit - 1, lines.length) : lines.length
+    // 清单模式返回的是**占位串**而非正文，真实尺寸由条目自带；此时若报「第 1-1 行 / 共 1 行 ·
+    // 55 字节」，就是把占位串的尺寸冒充成条目尺寸（与正文里的真实尺寸自相矛盾）⇒ 改报真实尺寸。
+    const size =
+      Number.isInteger(entry?.bytes) && Number.isInteger(entry?.lines)
+        ? `${entry.bytes.toLocaleString('en-US')} 字节 / ${entry.lines.toLocaleString('en-US')} 行`
+        : `第 ${from}-${to} 行 / 共 ${lines.length} 行 · ${byteLen(text)} 字节`
     const head =
       `--- turn ${entry?.turn ?? '?'} step ${entry?.step ?? '?'} · ${entry?.toolName ?? 'tool'}` +
-      `${entry?.hint ? ` · ${entry.hint}` : ''} · 第 ${from}-${to} 行 / 共 ${lines.length} 行 · ${byteLen(text)} 字节` +
+      `${entry?.hint ? ` · ${entry.hint}` : ''} · ${size}` +
       `${entry?.file ? `\n    路径：${entry.file}` : ''} ---`
     const body = lines.slice(from - 1, to).join('\n')
     const tail = to < lines.length ? `\n…（本结果还有 ${lines.length - to} 行未显示；续取：offset=${to + 1}${limit > 0 ? `, limit=${limit}` : ''}）` : ''
@@ -610,6 +616,9 @@ async function listResults(session, logsDir) {
       toolName: item.tool,
       hint: item.hint,
       file: item.file,
+      // 真实尺寸：渲染器据此报条目大小，而不是报下面那行占位串的大小。
+      bytes: item.bytes,
+      lines: item.lines,
       text: `（清单模式不返回正文）${item.bytes.toLocaleString('en-US')} 字节 / ${item.lines} 行`,
     })),
     note: '上面每条都带路径，可直接 read/grep；要看正文也可用 turn（+可选 step）取回。',

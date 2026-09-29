@@ -4,7 +4,7 @@
 
 DSH 宿主插件：在工具结果**进入上下文之前**做准入过滤。超过阈值的纯文本结果全文落盘到会话目录，模型只收到「收据 + 有界预览 + 绝对路径」；需要原文时用内置 `read`（分页）或 `grep`（检索）取回，也可用插件提供的 `read_tool_result_log` 按轮/步/时间取回。
 
-当前版本：**0.8.2**。
+当前版本：**0.8.3**。
 
 ## 机制
 
@@ -105,6 +105,7 @@ dsh plugin --profile web add dsh-clear-tool-results
   ```
 
   整份载荷受 **48000 字节**预算约束，超预算的条目会被跳过并提示缩小 `turn+step` 范围或直接 `read` 路径。
+- 都不传时是**清单模式**：不返回正文，每条的头行只给**真实尺寸**（`10,238 字节 / 82 行`）与路径，没有行窗口（正文里那行「（清单模式不返回正文）…」只是占位）。
 - `turn` 不是正整数时报错「轮次编号必须为正整数」；该轮无归档时报错并列出已归档轮次；`time` 无法解析时报错。
 - **旧归档可读**：0.7.0 写的 `round-NNNN.json` 仍可按轮取回（正文从旧事件的 `tool-result` block 中提取）；旧版 `index.json`（只有 `rounds`、没有 `results`）按空结果集处理，由旧文件兜底。
 
@@ -139,7 +140,7 @@ dsh plugin --profile web add dsh-clear-tool-results
 
 ## 验证
 
-- **确定性测试（L1，已入库）**：`npm test`（`node --test "test/*.test.mjs"`）跑 **85** 个用例，mock `ctx` 直驱 `tools/post-execute` 与取回工具。覆盖：**准入判定** 15（阈值边界、按字节不按字符、多 text block 无分隔符拼接、豁免与 `isError`/嵌套/非纯文本/`value` 原样）、**收据与预览** 12（头行格式、取端规则、300 字节硬上限、单行裁切不切坏码点、收据恒短于原文、无「已清除/已删除」）、**落盘与索引** 17（文件名与截断、幂等、ordinal、并发、索引损坏重建、路径编码、`locate` 与回退、无收益时不落盘）、**取回** 13（清单 / turn / step / time、逐条 offset·limit、48000 预算跳过、报错分支、旧 `round-NNNN.json` 回读）、**旧数据回读** 4、**状态与命令** 6、**宿主共存** 8（waterfall 顺序、内层改写被丢弃、反序时收据被覆盖但全文已落盘、`read` 双豁免、`additionalContexts` 透传）、**失败路径** 10（不可写、日志不可写、`DSH_HOME` 不存在、非 ASCII cwd）。用例走隔离的临时 `DSH_HOME`，每条一份全新模块实例（`DSH_HOME` 与 `stateCache` 都在 import 时定型）。
+- **确定性测试（L1，已入库）**：`npm test`（`node --test "test/*.test.mjs"`）跑 **87** 个用例，mock `ctx` 直驱 `tools/post-execute` 与取回工具。覆盖：**准入判定** 15（阈值边界、按字节不按字符、多 text block 无分隔符拼接、豁免与 `isError`/嵌套/非纯文本/`value` 原样）、**收据与预览** 12（头行格式、取端规则、300 字节硬上限、单行裁切不切坏码点、收据恒短于原文、无「已清除/已删除」）、**落盘与索引** 17（文件名与截断、幂等、ordinal、并发、索引损坏重建、路径编码、`locate` 与回退、无收益时不落盘）、**取回** 15（清单 / turn / step / time、逐条 offset·limit、48000 预算跳过、报错分支、旧 `round-NNNN.json` 回读）、**旧数据回读** 4、**状态与命令** 6、**宿主共存** 8（waterfall 顺序、内层改写被丢弃、反序时收据被覆盖但全文已落盘、`read` 双豁免、`additionalContexts` 透传）、**失败路径** 10（不可写、日志不可写、`DSH_HOME` 不存在、非 ASCII cwd）。用例走隔离的临时 `DSH_HOME`，每条一份全新模块实例（`DSH_HOME` 与 `stateCache` 都在 import 时定型）。
 - **端到端**：用 `web_fetch` 这类**结果大小不可预处理**的工具（`bash` 不行——模型会主动把大输出重定向掉）。用隔离的 `DSH_HOME` 起 headless 会话，抓一个超过 1024 字节的页面：
 
 ```sh

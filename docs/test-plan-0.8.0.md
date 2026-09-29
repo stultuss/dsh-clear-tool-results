@@ -67,7 +67,7 @@
   1. `DSH_HOME` 是模块顶层常量 ⇒ 必须在 `import` **之前**设 `process.env.DSH_HOME`，不能测试中途改；
   2. `stateCache` 也在 import 时读盘 ⇒ 测「禁用态」要先写好状态文件再 import（或经命令 handler 调 `writeState`）。
 - mock ctx 需提供：`commands.register`、`on`（捕获 `session/event`、`tools/post-execute` 回调）、`tools.register`、`get('sessionPersistence')`（返回带 `locate()` 的假对象，或故意抛错走回退）、`logger.warn`。
-- 运行形式：`npm test`（= `node --test "test/*.test.mjs"`，用显式 glob 以免把 `test/harness.mjs` 当成测试文件）。**已入库（2026-09-29），85 个用例全绿**；脚手架在 `test/harness.mjs`，按文件分组：`a-admission`(15) / `b-receipt`(12) / `c-storage`(17) / `d-retrieval`(13) / `e-legacy`(4) / `f-state`(6) / `l5-coexistence`(8) / `l6-failures`(10)。每条用例用带 `?v=N` 查询串的 `import()` 拿**全新模块实例**，并配一个隔离的临时 `DSH_HOME`——这正是上面两条 import 陷阱的对策。
+- 运行形式：`npm test`（= `node --test "test/*.test.mjs"`，用显式 glob 以免把 `test/harness.mjs` 当成测试文件）。**已入库（2026-09-29），85 个用例全绿**；脚手架在 `test/harness.mjs`，按文件分组：`a-admission`(15) / `b-receipt`(12) / `c-storage`(17) / `d-retrieval`(15) / `e-legacy`(4) / `f-state`(6) / `l5-coexistence`(8) / `l6-failures`(10)。每条用例用带 `?v=N` 查询串的 `import()` 拿**全新模块实例**，并配一个隔离的临时 `DSH_HOME`——这正是上面两条 import 陷阱的对策。
 
 ### 3.2 A 准入判定（`onPostExecute`）
 
@@ -130,6 +130,8 @@
 | # | 调用 | 期望 |
 |---|---|---|
 | D1 | 无参 | 清单模式：`rounds` 汇总 + 最近 40 条坐标/路径，正文为「（清单模式不返回正文）N 字节 / M 行」 |
+| D1b | 无参（0.8.3 修复） | 头行报**真实** `bytes`/`lines`（= 索引值），且**不出现**「第 1-1 行」这种行窗声明（旧版把占位串的 1 行 / 55 字节冒充成条目尺寸） |
+| D1c | `{turn:1}` | 轮次模式头行格式**不变**：`第 1-80 行 / 共 80 行 · N 字节`（回归保护） |
 | D2 | `{turn: 1}` | 该轮全部条目原文 + 每条 `路径：` |
 | D3 | `{turn: 2, step: 3}` | 仅该步条目 |
 | D4 | `{turn: 1, offset: 5, limit: 3}`，两条长度不同的结果 | offset/limit **对每条各自生效**（`renderRetrieval` 的窗口计算），不是全局行游标 |
@@ -256,7 +258,7 @@ dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "<固定 prompt>
 | 4.2 | 单条目 | `dsh --profile web --dump-config \| grep -n -B2 -A2 'clear-tool-results'` | **恰好一条** entry，来自 bundle 层 |
 | 4.3 | 残留文件审计 | profile 下 `cordis.patch.yml.bak-20260928-134448`、`cordis.patch.yml.dup-135322` | 文件名不匹配加载名 ⇒ 断言**未被加载**；是否清理见 §13 |
 | 4.4 | 三态实测 | 真实 GUI 里 `on`/`off`/`status`；OFF 时用 >1024 B 的 `web_fetch` 验证原样，ON 时验证收据化 | 行为与文案一致 |
-| 4.5 | 禁用态工具注册 | OFF 时观察 `read_tool_result_log` 是否仍在工具列表 | 按代码**仍在**（`apply()` 里的 `ctx.tools.register`）——观测项 |
+| 4.5 | 禁用态工具注册 | ✅ **真实环境已验（2026-09-29）**：OFF 态下真实调用 `read_tool_result_log`（无参）返回 15 条归档清单，未被收据化 ⇒ 仍注册且可用 |
 | 4.6 | 副本一致性 | `md5 -q` 比对仓库 / 已装副本 | 相同；改代码后必须重装，否则「测 A 跑 B」 |
 | 4.7 | 卸载 | README §卸载 三步 | dump-config 无条目、工具消失、状态文件保留但无效 |
 
@@ -347,7 +349,7 @@ dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "<固定 prompt>
 
 ## 13. 待决策点
 
-1. **【已完成·2026-09-29】L1 脚本已入库**：`test/` + `npm test`（`node --test "test/*.test.mjs"`），**85 个用例全绿**（A 15 / B 12 / C 17 / D 13 / E 4 / F 6 / L5 8 / L6 10）。脚手架 `test/harness.mjs` 每个用例一份全新模块实例 + 隔离临时 `DSH_HOME`（对应 §3.1 的两条 import 陷阱）。**其余已知偏差按"记行为、不判对错"落地**：C3 `t0000`、C6b `callId` 缺失不幂等、C9 索引损坏丢条目、F3 默认开、F5/F6（B5 已在 0.8.2 修掉）。**新增发现**：`callId` 缺失时文件名该段是**空**（`…-bash-.txt`），不是 `undefined`——`safeSegment` 用的是 `?? ''`。
+1. **【已完成·2026-09-29】L1 脚本已入库**：`test/` + `npm test`（`node --test "test/*.test.mjs"`），**87 个用例全绿**（A 15 / B 12 / C 17 / D 15 / E 4 / F 6 / L5 8 / L6 10）。脚手架 `test/harness.mjs` 每个用例一份全新模块实例 + 隔离临时 `DSH_HOME`（对应 §3.1 的两条 import 陷阱）。**其余已知偏差按"记行为、不判对错"落地**：C3 `t0000`、C6b `callId` 缺失不幂等、C9 索引损坏丢条目、F3 默认开、F5/F6（B5 已在 0.8.2 修掉）。**新增发现**：`callId` 缺失时文件名该段是**空**（`…-bash-.txt`），不是 `undefined`——`safeSegment` 用的是 `?? ''`。
 2. 沙箱 `node_modules` symlink 是否改为复制（真隔离）。
 3. `.sandbox/plugin/package.json` 版本号 0.7.0 是否同步修正。
 4. profile 里 `.bak` / `.dup` 残件是否清理。
@@ -361,16 +363,17 @@ dsh --profile headless --patch <repo>/.sandbox/plugin-patch.yml "<固定 prompt>
 12. **A3 是否进正式口径**：把「绕道重获」写进 §4.4 的判定口径，还是只作为补丁信号保留在测量脚本里。
 13. **【已评估·2026-09-29】阈值维持 1024**（数据在 `.sandbox/evidence/2026-09-29/r-measure/`）：用**真** `receiptText` 重算本机 80 会话 / 1,238 条触发：`R̄ = 705 B`、`R` 上限 827 B、`p* = 75.5%`（与记录 75.6% 一致）。阈值扫描 `p*` = 75.5 / 79.2 / 82.0 / 85.7 / 87.9%（1024 / 1536 / 2048 / 3072 / 4096）；净省在 `p ≤ 0.2` 时 1024 最优、`p = 0.3` 时三档几乎相同（3,395 / 3,411 / 3,356 KB）、`p ≥ 0.5` 时 2048 领先约 8%。**结论：取回率测准之前不动 1024**；若 L2 测出 `p̂ > 0.4`，首选动作是把阈值提到 1536–2048（不是压预览——删掉整条指引行只值 +1.5pp `p*`）。
 14. **【已修·2026-09-29】B5 单行超预算预览 → 预览硬上限**（0.8.2）：`takeLines` 首行超预算时改按码点裁切（`clipLine`），并新增 `saveResult` 护栏「收据不比原文短就不落盘」。实测影响 10/1,238 条（0.8%），修复前这 10 条全部产出「收据 ≥ 原文」（合计多 +4.1 KB，单条最多 +437 B），修复后 `R ≥ S` 为 0。
-15. **【新增·2026-09-29】**spill 内层重复落盘（>50000 B 结果被 `dsh-spill-policy` 与本插件各存一份）。已知冗余，未处理；要不要在收据里额外给出 spill 路径或干脆接受，待定。
+15. **【已修·2026-09-29】清单模式头行报错尺寸 → 0.8.3**：`renderRetrieval` 从 `entry.text` 推行数/字节，而清单模式的 `text` 是**单行占位串**，于是头行报「第 1-1 行 / 共 1 行 · 55 字节」，与该条真实尺寸自相矛盾。修法：清单条目自带真实 `bytes`/`lines`，头行优先报它并去掉行窗声明；轮次模式格式不变。发现途径是真实环境 OFF 态验证时读清单输出（`.sandbox/evidence/2026-09-29/l4/README.md`）。新增 `D1b`/`D1c` 两条断言。
+16. **【新增·2026-09-29】**spill 内层重复落盘（>50000 B 结果被 `dsh-spill-policy` 与本插件各存一份）。已知冗余，未处理；要不要在收据里额外给出 spill 路径或干脆接受，待定。
 
 ## 14. 执行状态回填（截至 2026-09-29）
 
 | 门 | 状态 |
 |---|---|
-| G1 L1 | **通过（2026-09-29）**——`test/` 已入库，`npm test` **85/85** 全绿（B5 已在 0.8.2 修掉，其余 §3.8 已知项按"记行为"处理） |
+| G1 L1 | **通过（2026-09-29）**——`test/` 已入库，`npm test` **87/87** 全绿（B5 已在 0.8.2 修掉，其余 §3.8 已知项按"记行为"处理） |
 | G2 L2 取回率 | **未判定**——真实收据 0 条；口径已补 A3 盲区（§4.4） |
 | G3 L3 | **通过（2026-09-29）**——3.1/3.2/3.3/3.4/3.5/3.6 全部跑完：索引↔文件一致性 100%（0 缺失 / 0 bytes 不符 / 0 lines 不符 / 0 孤儿）、legacy 回读逐字节一致（75 条 0 处）、0.8.x 告警日志零新增（§5 第三行表） |
-| G4 L4 | **部分（2026-09-29 重装 0.8.2 并重启后）**——4.1 幂等重装 ✅、4.2 单条目 ✅（dump-config 548 行 / `clear-tool-results-host` 恰好 1 次，来自 bundle 层）、4.3 残留审计 ✅（`cordis.patch.yml` = `[]`）、4.6 副本一致性 ✅（仓库 = 已装副本 = `71582992…`）；**4.4 三态实测与 4.5 禁用态仍需真实 GUI 斜杠命令**。活体判据：单行 1,600 B 结果被裁到 300 B 且收据写「该行过长」（0.8.1 会整行返回），落盘文件 1,600 B 保真。证据 `.sandbox/evidence/2026-09-29/l4/` |
+| G4 L4 | **部分（2026-09-29 重装 0.8.2 并重启后；`off` 侧已实测）**——4.1 幂等重装 ✅、4.2 单条目 ✅（dump-config 548 行 / `clear-tool-results-host` 恰好 1 次，来自 bundle 层）、4.3 残留审计 ✅（`cordis.patch.yml` = `[]`）、4.6 副本一致性 ✅（仓库 = 已装副本 = `71582992…`）；**4.4 的 `off` 侧与 4.5 已实测（用户执行 `/clear-tool-results off` 后：状态文件翻 `false`、1,100 B 结果原样进上下文无收据、归档不增、工具仍可用）；`on`/`status` 待补齐**。活体判据：单行 1,600 B 结果被裁到 300 B 且收据写「该行过长」（0.8.1 会整行返回），落盘文件 1,600 B 保真。证据 `.sandbox/evidence/2026-09-29/l4/` |
 | G5 L5 | **通过（2026-09-29）**——5.1/5.2/5.3/5.4/5.6/5.7 均有确定结论并已固化为 8 条断言；仅 5.5（compaction pruner）因本机够不到 800k 阈值而未观测 |
 | G6 L6 | **部分**——10 个失败/并发场景已由 L1 覆盖（`l6-failures`）；真实环境：warning 日志审计**已做**（§5 三次复盘的 3.5：0.8.x 起 0 行）、**6.7 游标时序已测（错位 0/22）**；仍欠真实环境下的**失败注入**（需 headless 沙箱） |
 
