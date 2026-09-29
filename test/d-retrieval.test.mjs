@@ -2,10 +2,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { rmSync } from 'node:fs'
-import { boot, session, archive, findResults, readFirstIndex, callRetrieve, renderRetrieve, retrieveTool } from './harness.mjs'
+import { boot, session, archive, findResults, readFirstIndex, callRetrieve, renderRetrieve, retrieveTool, INLINE_MAX_BYTES } from './harness.mjs'
 
-const LP = (n, pad = 60) => Array.from({ length: n }, (_, i) => `line-${i}-` + 'x'.repeat(pad)).join('\n')
-const BIG = (n = 3000, c = 'Z') => c.repeat(n)
+// 行内容加宽，使 n 行总字节数**既超过准入阈值、又不撞上渲染预算**（48000）：
+//   LP(20) ≈ 9.7 KB > 8192 ✓   LP(80) ≈ 39 KB < 48000 ✓
+// **行数语义不变**（D 组大量断言依赖行号）。
+const LP = (n, pad = 480) => Array.from({ length: n }, (_, i) => `line-${i}-` + 'x'.repeat(pad)).join('\n')
+const BIG = (n = INLINE_MAX_BYTES + 64, c = 'Z') => c.repeat(n)
 
 test('D1 无参：清单模式，不返回正文', async (t) => {
   const env = await boot(t)
@@ -49,7 +52,7 @@ test('D1c 轮次模式头行格式不变（行窗仍在）', async (t) => {
 test('D2 {turn:1}：取回该轮正文与路径', async (t) => {
   const env = await boot(t)
   const s = session()
-  const text = BIG(2500, 'A')
+  const text = BIG(INLINE_MAX_BYTES + 1000, 'A')
   await archive(env, s, text, { turn: 1, step: 1, callId: 'd2-a' })
   const value = await callRetrieve(env, { turn: 1 }, s)
   assert.equal(value.toolResults.length, 1)
@@ -61,8 +64,8 @@ test('D2 {turn:1}：取回该轮正文与路径', async (t) => {
 test('D3 {turn, step}：只取该步', async (t) => {
   const env = await boot(t)
   const s = session()
-  await archive(env, s, BIG(2000, 'A'), { turn: 2, step: 3, callId: 'd3-a' })
-  await archive(env, s, BIG(2000, 'B'), { turn: 2, step: 4, callId: 'd3-b' })
+  await archive(env, s, BIG(INLINE_MAX_BYTES + 1000, 'A'), { turn: 2, step: 3, callId: 'd3-a' })
+  await archive(env, s, BIG(INLINE_MAX_BYTES + 1000, 'B'), { turn: 2, step: 4, callId: 'd3-b' })
   const value = await callRetrieve(env, { turn: 2, step: 3 }, s)
   assert.equal(value.toolResults.length, 1)
   assert.equal(value.toolResults[0].step, 3)
@@ -131,8 +134,8 @@ test('D9 time：毫秒串 / ISO 8601 / 不可解析', async (t) => {
 test('D10 归档 .txt 被删除：跳过该条，不谎报可读', async (t) => {
   const env = await boot(t)
   const s = session()
-  await archive(env, s, BIG(2000, 'A'), { turn: 1, step: 1, callId: 'd10-a' })
-  await archive(env, s, BIG(2000, 'B'), { turn: 1, step: 2, callId: 'd10-b' })
+  await archive(env, s, BIG(INLINE_MAX_BYTES + 1000, 'A'), { turn: 1, step: 1, callId: 'd10-a' })
+  await archive(env, s, BIG(INLINE_MAX_BYTES + 1000, 'B'), { turn: 1, step: 2, callId: 'd10-b' })
   const files = findResults(env.home).sort()
   rmSync(files[0])
   const value = await callRetrieve(env, { turn: 1 }, s)

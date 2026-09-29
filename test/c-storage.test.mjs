@@ -3,9 +3,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { boot, session, execOf, textResult, acceptOf, post, setCursor, archive, findIndexes, findResults, readFirstIndex, tempHome } from './harness.mjs'
+import { boot, session, execOf, textResult, acceptOf, post, setCursor, archive, findIndexes, findResults, readFirstIndex, tempHome, overThreshold, INLINE_MAX_BYTES } from './harness.mjs'
 
-const BIG = (c = 'z', n = 2000) => c.repeat(n)
+const BIG = (c = 'z') => overThreshold().replaceAll('x', c)
 
 test('C1 文件名形态', async (t) => {
   const env = await boot(t)
@@ -32,7 +32,7 @@ test('C3 游标缺失 → t0000-s0000，不抛错', async (t) => {
 
 test('C4 落盘内容与原文逐字节一致', async (t) => {
   const env = await boot(t)
-  const text = '中文内容 abc\n第二行\n' + BIG('q', 3000)
+  const text = '中文内容 abc\n第二行\n' + BIG('q')
   await archive(env, session(), text)
   const [file] = findResults(env.home)
   assert.equal(Buffer.compare(readFileSync(file), Buffer.from(text, 'utf8')), 0)
@@ -168,28 +168,35 @@ test('C12b get 抛错时回退默认布局', async (t) => {
   assert.ok(idx.results[0].file.includes(join('sessions', '--tmp-proj--', 'session-test', 'tool-result-logs', 'results')), idx.results[0].file)
 })
 
-test('C13 收据不短于原文时不落盘、原样放行（永不把上下文变大）', async (t) => {
-  // 只有超长 DSH_HOME + 超长 cwd（projectKey 上限 251）才会让收据长过刚过阈值的原文。
+test('C13 阈值 8192 下「收据不更短就不落盘」护栏不可达（算术事实；护栏保留为安全网）', async (t) => {
+  // 收据的可变部分只有 hint(≤60) + 路径 + 预览(≤300) + 固定约 219 ⇒ R 上限约 1.6 KB。
+  // 阈值升到 8192 后 R 不可能追上 S，因此护栏的 `return null` 分支在真实路径上不再可达
+  // （0.8.2 的 1024 阈值下它是可达的，本用例原先正是在这里断言"原样透传"）。
+  // 改为断言仍然成立、且更要紧的那条性质：**收据恒短于原文**（test-plan §3.8 记该分支为已记录未覆盖）。
   const home = join(tempHome(), 'h'.repeat(200))
   const env = await boot(t, { home })
-  const text = 'q'.repeat(1025)
+  const text = 'q'.repeat(INLINE_MAX_BYTES + 1)
   const inner = acceptOf(textResult(text).content)
   const exec = execOf({ name: 'bash', callId: 'call_c13', agent: { session: session('session-test', '/' + 'x'.repeat(400)) } })
   const decision = await post(env, exec, textResult(text), inner)
-  assert.equal(decision, inner, '原样透传 next() 的 decision')
-  assert.equal(findResults(env.home).length, 0, '不落盘')
-  assert.deepEqual(env.warns, [], '不是落盘失败，而是主动放弃')
+  assert.notEqual(decision, inner, '超阈值 ⇒ 收据化（不再是护栏放行）')
+  assert.ok(
+    Buffer.byteLength(decision.content[0].text, 'utf8') < Buffer.byteLength(text, 'utf8'),
+    '收据必须短于原文',
+  )
+  assert.equal(findResults(env.home).length, 1, '正常落盘')
+  assert.deepEqual(env.warns, [], '无落盘失败')
 })
 
-test('C13b 同一环境下原文更长时仍正常收据化（护栏只挡「收据更长」）', async (t) => {
+test('C13b 原文更长时正常收据化（护栏只挡「收据更长」）', async (t) => {
   const home = join(tempHome(), 'h'.repeat(200))
   const env = await boot(t, { home })
-  const text = 'q'.repeat(4000)
+  const text = 'q'.repeat(INLINE_MAX_BYTES + 4096)
   const inner = acceptOf(textResult(text).content)
   const exec = execOf({ name: 'bash', callId: 'call_c13b', agent: { session: session('session-test', '/' + 'x'.repeat(400)) } })
   const decision = await post(env, exec, textResult(text), inner)
   assert.notEqual(decision, inner)
   assert.equal(findResults(env.home).length, 1)
   assert.match(decision.content[0].text, /全文已落盘/)
-  assert.ok(Buffer.byteLength(decision.content[0].text, 'utf8') < 4000)
+  assert.ok(Buffer.byteLength(decision.content[0].text, 'utf8') < INLINE_MAX_BYTES + 4096)
 })

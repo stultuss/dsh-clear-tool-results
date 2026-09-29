@@ -88,7 +88,7 @@ test('B7 截断提示 X = total - lines', async (t) => {
 
 test('B8 行数一致性：收据 / split / index.lines 三者一致', async (t) => {
   const env = await boot(t)
-  const text = L(300)
+  const text = L(300, 'x'.repeat(40)) // 加宽行内容使总字节数超过准入阈值，同时保持恰好 300 行
   const { result } = await archive(env, session(), text)
   assert.match(result.content[0].text, /共 300 行/)
   const idx = await readFirstIndex(env.home)

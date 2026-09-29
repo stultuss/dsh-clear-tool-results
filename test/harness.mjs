@@ -3,13 +3,24 @@
 // 为什么必须"新鲜实例"：`DSH_HOME`（模块顶层常量）与 `stateCache`（import 时读盘）
 // 都在模块求值期定型，中途改 process.env 无效（见 test-plan §3.1 的两条陷阱）。
 // 用 `?v=N` 查询串让 ESM 每次都返回新实例。
-import { readdirSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { readdirSync, existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const PLUGIN_URL = pathToFileURL(fileURLToPath(new URL('../index.mjs', import.meta.url))).href
+const PLUGIN_SRC = fileURLToPath(new URL('../index.mjs', import.meta.url))
+const PLUGIN_URL = pathToFileURL(PLUGIN_SRC).href
 let seq = 0
+
+/**
+ * 准入阈值。**从源码读**，避免为了取一个常量而多求值一个模块实例。
+ * fixture 一律用 `overThreshold()` 构造（而不是写死字节数），否则阈值一变，
+ * 测试会"因为文本不再超阈值"而失真——可能变红，也可能**变成假绿**（见 C13）。
+ */
+export const INLINE_MAX_BYTES = Number(/const INLINE_MAX_BYTES = (\d+)/.exec(readFileSync(PLUGIN_SRC, 'utf8'))[1])
+
+/** 造一条必然超过准入阈值的纯文本（默认比阈值多 64 字节）。 */
+export const overThreshold = (extra = 64) => 'x'.repeat(INLINE_MAX_BYTES + extra)
 
 export const tempHome = () => mkdtempSync(join(tmpdir(), 'dsh-ctr-'))
 

@@ -3,9 +3,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { boot, session, execOf, textResult, acceptOf, post, setCursor, archive, findIndexes, findResults, readFirstIndex, callRetrieve, tempHome } from './harness.mjs'
+import { boot, session, execOf, textResult, acceptOf, post, setCursor, archive, findIndexes, findResults, readFirstIndex, callRetrieve, tempHome, overThreshold } from './harness.mjs'
 
-const BIG = (n = 2000, c = 'z') => c.repeat(n)
+// 默认即"刚过阈值"（阈值 +64 字节），所有用例都是"必须被收据化"的场景。
+const BIG = (c = 'z') => overThreshold().replaceAll('x', c)
 const isReceipt = (d) => Array.isArray(d?.content) && /^\[/.test(d.content[0].text ?? '')
 
 /** 把 index.json 换成同名目录 ⇒ 写入必然失败（可移植，不依赖权限）。 */
@@ -21,7 +22,7 @@ test('6.1 results 不可写：原样放行、结果不是 isError、warning 落�
   const home = tempHome()
   writeFileSync(join(home, 'blocker'), 'x')
   const env = await boot(t, { home, locate: () => ({ path: join(home, 'blocker', 's.jsonl') }) })
-  const text = BIG(5000)
+  const text = BIG()
   const decision = acceptOf(textResult(text).content)
   const out = await post(env, execOf({ agent: { session: session() } }), textResult(text), decision)
   assert.equal(out, decision)
@@ -33,11 +34,11 @@ test('6.1 results 不可写：原样放行、结果不是 isError、warning 落�
 test('6.2 index.json 非法 JSON：以空索引重建，.txt 保留', async (t) => {
   const env = await boot(t)
   const s = session()
-  await archive(env, s, BIG(2000, 'A'), { callId: 'c6-2-a' })
+  await archive(env, s, BIG('A'), { callId: 'c6-2-a' })
   const [indexFile] = findIndexes(env.home)
   const [oldTxt] = findResults(env.home)
   writeFileSync(indexFile, 'not json at all', 'utf8')
-  await archive(env, s, BIG(2000, 'B'), { callId: 'c6-2-b' })
+  await archive(env, s, BIG('B'), { callId: 'c6-2-b' })
   const idx = await readFirstIndex(env.home)
   assert.equal(idx.results.length, 1)
   assert.equal(idx.results[0].callId, 'c6-2-b')
@@ -48,7 +49,7 @@ test('6.3 index.json 写入失败：原样放行 + warning', async (t) => {
   const env = await boot(t)
   const s = session()
   await breakIndex(env, s)
-  const text = BIG(5000)
+  const text = BIG()
   const decision = acceptOf(textResult(text).content)
   const out = await post(env, execOf({ name: 'bash', callId: 'c6-3', agent: { session: s } }), textResult(text), decision)
   assert.equal(out, decision)
@@ -96,7 +97,7 @@ test('6.6 超长工具名/callId：截断到 16/12，文件名不超限', async 
 test('6.7 游标时序：turn/step 正确落到索引，并可精确定位', async (t) => {
   const env = await boot(t)
   const s = session()
-  const text = BIG(2000, 'A')
+  const text = BIG('A')
   await archive(env, s, text, { turn: 7, step: 2, callId: 'c6-7' })
   const idx = await readFirstIndex(env.home)
   assert.equal(idx.results[0].turn, 7)
@@ -111,7 +112,7 @@ test('6.8 warn() 自身失败（logger 抛错 + 日志路径不可写）不得�
   const env = await boot(t, { home, loggerWarnThrows: true })
   const s = session()
   await breakIndex(env, s)
-  const text = BIG(5000)
+  const text = BIG()
   const decision = acceptOf(textResult(text).content)
   const out = await post(env, execOf({ name: 'bash', callId: 'c6-8', agent: { session: s } }), textResult(text), decision)
   assert.equal(out, decision, 'warn 自身失败也必须原样返回，不得抛出')
